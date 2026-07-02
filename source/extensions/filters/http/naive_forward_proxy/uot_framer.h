@@ -149,7 +149,6 @@ private:
   size_t addr_needed_ = 0;
   std::string domain_buf_;
   size_t domain_needed_ = 0;
-  uint16_t port_ = 0;
 
   // Data frame state.
   uint16_t data_length_ = 0;
