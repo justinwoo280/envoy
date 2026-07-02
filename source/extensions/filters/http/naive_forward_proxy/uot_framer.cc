@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cstring>
 
-#include "source/common/buffer/buffer_util.h"
 #include "source/common/common/byte_order.h"
 
 namespace Envoy {
