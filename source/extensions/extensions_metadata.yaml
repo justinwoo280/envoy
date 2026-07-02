@@ -675,6 +675,13 @@ envoy.filters.http.mcp_router:
   status: alpha
   type_urls:
   - envoy.extensions.filters.http.mcp_router.v3.McpRouter
+envoy.filters.http.naive_forward_proxy:
+  categories:
+  - envoy.filters.http
+  security_posture: robust_to_untrusted_downstream_and_upstream
+  status: alpha
+  type_urls:
+  - envoy.extensions.filters.http.naive_forward_proxy.v3.NaiveForwardProxy
 envoy.filters.http.oauth2:
   categories:
   - envoy.filters.http
@@ -1719,6 +1726,13 @@ envoy.transport_sockets.tls:
   type_urls:
   - envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
   - envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+envoy.tls_handshakers.reality:
+  categories:
+  - envoy.tls_handshakers
+  security_posture: robust_to_untrusted_downstream
+  status: alpha
+  type_urls:
+  - envoy.extensions.transport_sockets.reality.v3.RealityConfig
 envoy.transport_sockets.upstream_proxy_protocol:
   categories:
   - envoy.transport_sockets.upstream

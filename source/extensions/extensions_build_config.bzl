@@ -204,6 +204,7 @@ EXTENSIONS = {
     "envoy.filters.http.mcp":                           "//source/extensions/filters/http/mcp:config",
     "envoy.filters.http.mcp_json_rest_bridge":          "//source/extensions/filters/http/mcp_json_rest_bridge:config",
     "envoy.filters.http.mcp_router":                    "//source/extensions/filters/http/mcp_router:config",
+    "envoy.filters.http.naive_forward_proxy":            "//source/extensions/filters/http/naive_forward_proxy:config",
     "envoy.filters.http.rate_limit_quota":              "//source/extensions/filters/http/rate_limit_quota:config",
     # Disabled by default. kill_request is not built into most prebuilt images.
     # For instructions for building with disabled-by-default filters enabled, see
@@ -441,6 +442,12 @@ EXTENSIONS = {
 
     "envoy.tls.cert_validator.dynamic_modules":          "//source/extensions/transport_sockets/tls/cert_validator/dynamic_modules:config",
     "envoy.tls.cert_validator.spiffe":                  "//source/extensions/transport_sockets/tls/cert_validator/spiffe:config",
+
+    #
+    # TLS handshakers
+    #
+
+    "envoy.tls_handshakers.reality":                    "//source/extensions/transport_sockets/reality:reality",
 
     #
     # HTTP header formatters
