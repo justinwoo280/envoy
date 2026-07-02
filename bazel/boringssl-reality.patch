@@ -1,0 +1,231 @@
+diff -ruN a/include/openssl/ssl.h b/include/openssl/ssl.h
+--- a/include/openssl/ssl.h	2026-06-30 09:46:53.845089762 +0000
++++ b/include/openssl/ssl.h	2026-06-30 09:46:53.849089780 +0000
+@@ -5282,6 +5282,13 @@
+     SSL_CTX *ctx,
+     enum ssl_select_cert_result_t (*cb)(const SSL_CLIENT_HELLO *));
+ 
++// SSL_set_reality_serverhello_cb installs a global callback that, if it returns
++// a non-null buffer, supplies the real-target ServerHello to emit byte-for-byte
++// (only the key_share ciphertext is replaced with our own). This enables
++// REALITY-style TLS mirror fingerprinting with a single small patch.
++OPENSSL_EXPORT void SSL_set_reality_serverhello_cb(
++    bool (*cb)(SSL *ssl, const uint8_t **out, size_t *out_len));
++
+ // SSL_CTX_set_dos_protection_cb sets a callback that is called once the
+ // resumption decision for a ClientHello has been made. It can return one to
+ // allow the handshake to continue or zero to cause the handshake to abort.
+diff -ruN a/ssl/tls13_server.cc b/ssl/tls13_server.cc
+--- a/ssl/tls13_server.cc	2026-06-30 09:46:53.841089743 +0000
++++ b/ssl/tls13_server.cc	2026-06-30 09:46:53.845089762 +0000
+@@ -34,6 +34,11 @@
+ #include "internal.h"
+ 
+ 
++// === REALITY: global ServerHello mirror callback (defined at file end) ===
++extern bool (*reality_serverhello_cb)(SSL *ssl, const uint8_t **out,
++                                      size_t *out_len);
++
++
+ BSSL_NAMESPACE_BEGIN
+ 
+ static const uint8_t kZeroes[EVP_MAX_MD_SIZE] = {0};
+@@ -989,62 +994,136 @@
+   return ssl_hs_ok;
+ }
+ 
++// REALITY: replace the key_share extension's ciphertext in a ServerHello in
++// place. Assumes the same group (and thus same ciphertext length), which holds
++// when both sides use X25519. Returns false on any parse/length mismatch.
++static bool reality_replace_key_share(Array<uint8_t> *sh,
++                                      Span<const uint8_t> new_ks) {
++  uint8_t *p = sh->data();
++  size_t len = sh->size();
++  // handshake header(4) + legacy_version(2) + random(32) + session_id_len(1)
++  if (len < 4 + 2 + 32 + 1) {
++    return false;
++  }
++  size_t off = 4 + 2 + 32;
++  off += 1 + p[off];             // session_id
++  off += 2 + 1;                  // cipher_suite + compression
++  if (off + 2 > len) {
++    return false;
++  }
++  size_t ext_total = (size_t(p[off]) << 8) | p[off + 1];
++  off += 2;
++  size_t ext_end = off + ext_total;
++  if (ext_end > len) {
++    return false;
++  }
++  while (off + 4 <= ext_end) {
++    uint16_t etype = (uint16_t(p[off]) << 8) | p[off + 1];
++    uint16_t elen = (uint16_t(p[off + 2]) << 8) | p[off + 3];
++    off += 4;
++    if (off + elen > ext_end) {
++      return false;
++    }
++    if (etype == TLSEXT_TYPE_key_share) {
++      // server_share = group(2) + key_len(2) + key_data(key_len)
++      if (elen < 4) {
++        return false;
++      }
++      uint16_t key_len = (uint16_t(p[off + 2]) << 8) | p[off + 3];
++      if (4 + key_len != elen || key_len != new_ks.size()) {
++        return false;
++      }
++      OPENSSL_memcpy(p + off + 4, new_ks.data(), new_ks.size());
++      return true;
++    }
++    off += elen;
++  }
++  return false;
++}
++
+ static enum ssl_hs_wait_t do_send_server_hello(SSL_HANDSHAKE *hs) {
+   SSL *const ssl = hs->ssl;
+ 
+-  Span<uint8_t> random(ssl->s3->server_random);
++  Array<uint8_t> server_hello;
++  ScopedCBB cbb;
++  CBB body;
+ 
+-  SSL_HANDSHAKE_HINTS *const hints = hs->hints.get();
+-  if (hints && !hs->hints_requested &&
+-      hints->server_random_tls13.size() == random.size()) {
+-    OPENSSL_memcpy(random.data(), hints->server_random_tls13.data(),
+-                   random.size());
+-  } else {
+-    RAND_bytes(random.data(), random.size());
+-    if (hints && hs->hints_requested &&
+-        !hints->server_random_tls13.CopyFrom(random)) {
+-      return ssl_hs_error;
++  // === REALITY byte-level ServerHello mirror patch ===
++  // If the Envoy layer supplied a real-target ServerHello (via
++  // SSL_set_reality_serverhello_cb, after dialing the mirror target), emit it
++  // byte-for-byte, replacing only the key_share data with our own. This keeps
++  // the extension order/set identical to the real target (defeating
++  // fingerprinting) while we retain the key-share private key.
++  bool reality_mirrored = false;
++  if (::reality_serverhello_cb != nullptr) {
++    const uint8_t *real_sh = nullptr;
++    size_t real_len = 0;
++    if (::reality_serverhello_cb(ssl, &real_sh, &real_len) &&
++        real_sh != nullptr && real_len >= 4 + 2 + 32) {
++      if (!server_hello.CopyFrom(Span(real_sh, real_len))) {
++        return ssl_hs_error;
++      }
++      // Adopt the real target's random so the transcript matches emitted bytes.
++      OPENSSL_memcpy(ssl->s3->server_random, real_sh + 4 + 2, 32);
++      if (!reality_replace_key_share(&server_hello, hs->key_share_ciphertext)) {
++        return ssl_hs_error;
++      }
++      reality_mirrored = true;
+     }
+   }
+ 
+-  Array<uint8_t> server_hello;
+-  ScopedCBB cbb;
+-  CBB body, extensions, session_id;
+-  if (!ssl->method->init_message(ssl, cbb.get(), &body, SSL3_MT_SERVER_HELLO) ||
+-      !CBB_add_u16(&body,
+-                   SSL_is_dtls(ssl) ? DTLS1_2_VERSION : TLS1_2_VERSION) ||
+-      !CBB_add_bytes(&body, ssl->s3->server_random,
+-                     sizeof(ssl->s3->server_random)) ||
+-      !CBB_add_u8_length_prefixed(&body, &session_id) ||
+-      !CBB_add_bytes(&session_id, hs->session_id.data(),
+-                     hs->session_id.size()) ||
+-      !CBB_add_u16(&body, SSL_CIPHER_get_protocol_id(hs->new_cipher)) ||
+-      !CBB_add_u8(&body, 0) ||
+-      !CBB_add_u16_length_prefixed(&body, &extensions) ||
+-      !ssl_ext_pre_shared_key_add_serverhello(hs, &extensions) ||
+-      !ssl_ext_pake_add_serverhello(hs, &extensions) ||
+-      !ssl_ext_key_share_add_serverhello(hs, &extensions) ||
+-      !ssl_ext_supported_versions_add_serverhello(hs, &extensions) ||
+-      !ssl->method->finish_message(ssl, cbb.get(), &server_hello)) {
+-    return ssl_hs_error;
+-  }
++  if (!reality_mirrored) {
++    Span<uint8_t> random(ssl->s3->server_random);
++    SSL_HANDSHAKE_HINTS *const hints = hs->hints.get();
++    if (hints && !hs->hints_requested &&
++        hints->server_random_tls13.size() == random.size()) {
++      OPENSSL_memcpy(random.data(), hints->server_random_tls13.data(),
++                     random.size());
++    } else {
++      RAND_bytes(random.data(), random.size());
++      if (hints && hs->hints_requested &&
++          !hints->server_random_tls13.CopyFrom(random)) {
++        return ssl_hs_error;
++      }
++    }
+ 
+-  assert(ssl->s3->ech_status != ssl_ech_accepted || hs->ech_is_inner);
+-  if (hs->ech_is_inner) {
+-    // Fill in the ECH confirmation signal.
+-    const size_t offset = ssl_ech_confirmation_signal_hello_offset(ssl);
+-    auto random_suffix = random.last<ECH_CONFIRMATION_SIGNAL_LEN>();
+-    if (!ssl_ech_accept_confirmation(hs, random_suffix, ssl->s3->client_random,
+-                                     hs->transcript,
+-                                     /*is_hrr=*/false, server_hello, offset)) {
++    CBB extensions, session_id;
++    if (!ssl->method->init_message(ssl, cbb.get(), &body, SSL3_MT_SERVER_HELLO) ||
++        !CBB_add_u16(&body,
++                     SSL_is_dtls(ssl) ? DTLS1_2_VERSION : TLS1_2_VERSION) ||
++        !CBB_add_bytes(&body, ssl->s3->server_random,
++                       sizeof(ssl->s3->server_random)) ||
++        !CBB_add_u8_length_prefixed(&body, &session_id) ||
++        !CBB_add_bytes(&session_id, hs->session_id.data(),
++                       hs->session_id.size()) ||
++        !CBB_add_u16(&body, SSL_CIPHER_get_protocol_id(hs->new_cipher)) ||
++        !CBB_add_u8(&body, 0) ||
++        !CBB_add_u16_length_prefixed(&body, &extensions) ||
++        !ssl_ext_pre_shared_key_add_serverhello(hs, &extensions) ||
++        !ssl_ext_pake_add_serverhello(hs, &extensions) ||
++        !ssl_ext_key_share_add_serverhello(hs, &extensions) ||
++        !ssl_ext_supported_versions_add_serverhello(hs, &extensions) ||
++        !ssl->method->finish_message(ssl, cbb.get(), &server_hello)) {
+       return ssl_hs_error;
+     }
+ 
+-    // Update |server_hello|.
+-    auto server_hello_out =
+-        Span(server_hello).subspan(offset).first<ECH_CONFIRMATION_SIGNAL_LEN>();
+-    OPENSSL_memcpy(server_hello_out.data(), random_suffix.data(),
+-                   ECH_CONFIRMATION_SIGNAL_LEN);
++    assert(ssl->s3->ech_status != ssl_ech_accepted || hs->ech_is_inner);
++    if (hs->ech_is_inner) {
++      // Fill in the ECH confirmation signal.
++      const size_t offset = ssl_ech_confirmation_signal_hello_offset(ssl);
++      auto random_suffix = random.last<ECH_CONFIRMATION_SIGNAL_LEN>();
++      if (!ssl_ech_accept_confirmation(hs, random_suffix, ssl->s3->client_random,
++                                       hs->transcript,
++                                       /*is_hrr=*/false, server_hello, offset)) {
++        return ssl_hs_error;
++      }
++
++      // Update |server_hello|.
++      auto server_hello_out =
++          Span(server_hello).subspan(offset).first<ECH_CONFIRMATION_SIGNAL_LEN>();
++      OPENSSL_memcpy(server_hello_out.data(), random_suffix.data(),
++                     ECH_CONFIRMATION_SIGNAL_LEN);
++    }
+   }
+ 
+   if (!ssl->method->add_message(ssl, std::move(server_hello))) {
+@@ -1603,3 +1682,16 @@
+ }
+ 
+ BSSL_NAMESPACE_END
++
++// === REALITY byte-level ServerHello mirror hook ===
++// When set via SSL_set_reality_serverhello_cb, do_send_server_hello consults
++// this callback. If it returns a non-null buffer, that real-target ServerHello
++// is emitted byte-for-byte (only key_share is replaced with our own), so the
++// ServerHello's extension order/set matches the mirror target exactly.
++bool (*reality_serverhello_cb)(SSL *ssl, const uint8_t **out, size_t *out_len) =
++    nullptr;
++
++extern "C" void SSL_set_reality_serverhello_cb(
++    bool (*cb)(SSL *ssl, const uint8_t **out, size_t *out_len)) {
++  reality_serverhello_cb = cb;
++}
