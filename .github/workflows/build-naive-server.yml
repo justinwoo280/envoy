@@ -52,57 +52,45 @@ jobs:
           sudo docker image prune --all --force || true
           df -h /
 
-      - name: Resolve the official envoy build image
-        id: img
-        run: |
-          # ci/envoy_build_sha.sh sets BUILD_CONTAINER to the pinned image.
-          . ./ci/envoy_build_sha.sh
-          echo "image=${BUILD_CONTAINER}" >>"$GITHUB_OUTPUT"
-          echo "Using build image: ${BUILD_CONTAINER}"
-
-      - name: Cache bazel repository + disk cache
+      # The official envoy build image has a custom entrypoint that sets up the
+      # envoybuild user and /build mount, then runs $DOCKER_COMMAND as that
+      # user. We MUST go through ci/run_envoy_docker.sh instead of a raw
+      # `docker run`, otherwise the container exits immediately (exit 3).
+      # The docker build dir (mapped to /build inside) holds the bazel caches;
+      # we cache it on the host so reruns are faster.
+      - name: Cache bazel build dir (disk + repo cache)
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cache/bazel-disk
-            ~/.cache/bazel-repo
-          # Cache keyed on dependency pins so it invalidates when deps change.
+          path: /tmp/envoy-docker-build
           key: bazel-${{ runner.os }}-${{ hashFiles('bazel/repository_locations.bzl', '.bazelversion', 'WORKSPACE') }}
           restore-keys: |
             bazel-${{ runner.os }}-
 
       - name: Build envoy-static (minimal allowlist, wasm disabled)
         env:
-          IMAGE: ${{ steps.img.outputs.image }}
           COMPILE_MODE: ${{ github.event.inputs.compile_mode || 'opt' }}
         run: |
           set -euo pipefail
-          mkdir -p ~/.cache/bazel-disk ~/.cache/bazel-repo
-          # Run the build inside the official image so the toolchain matches CI.
-          # Keep --jobs modest so link actions don't OOM on a 16 GB runner.
-          docker run --rm \
-            -v "$PWD":/source -w /source \
-            -v "$HOME/.cache/bazel-disk":/bazel-disk \
-            -v "$HOME/.cache/bazel-repo":/bazel-repo \
-            -e HOME=/tmp \
-            "$IMAGE" \
-            bash -eguxo pipefail -c '
-              bazel build \
-                --config=clang \
-                --disk_cache=/bazel-disk \
-                --repository_cache=/bazel-repo \
-                --jobs=4 \
-                --local_ram_resources=13000 \
-                --define=wasm=disabled \
-                --define=hot_restart=disabled \
-                --define=admin_html=disabled \
-                --define=signal_trace=disabled \
-                --define=deprecated_features=disabled \
-                -c '"$COMPILE_MODE"' \
-                //source/exe:envoy-static
-              strip -s bazel-bin/source/exe/envoy-static -o /source/envoy-min
-              /source/envoy-min --version
-            '
+          mkdir -p /tmp/envoy-docker-build
+          # Run inside the official image via the official wrapper. Bazel caches
+          # live under /build (the mounted ENVOY_DOCKER_BUILD_DIR). --jobs modest
+          # so link actions don't OOM on a 16 GB runner.
+          ./ci/run_envoy_docker.sh "
+            bazel build \
+              --config=clang \
+              --disk_cache=/build/bazel-disk \
+              --repository_cache=/build/bazel-repo \
+              --jobs=4 \
+              --local_ram_resources=13000 \
+              --define=wasm=disabled \
+              --define=hot_restart=disabled \
+              --define=admin_html=disabled \
+              --define=signal_trace=disabled \
+              --define=deprecated_features=disabled \
+              -c ${COMPILE_MODE} \
+              //source/exe:envoy-static \
+            && strip -s bazel-bin/source/exe/envoy-static -o /source/envoy-min \
+            && /source/envoy-min --version"
           ls -lh envoy-min
 
       - name: Upload envoy-min artifact
