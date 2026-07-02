@@ -5,6 +5,7 @@
 #include <cstring>
 #include <random>
 
+#include "envoy/common/exception.h"
 #include "envoy/http/header_map.h"
 #include "envoy/network/address.h"
 #include "envoy/network/socket.h"
@@ -13,9 +14,12 @@
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/base64.h"
 #include "source/common/common/utility.h"
+#include "source/common/http/header_map_impl.h"
 #include "source/common/http/header_utility.h"
 #include "source/common/http/headers.h"
 #include "source/common/network/address_impl.h"
+#include "source/common/network/dns_resolver/dns_factory_util.h"
+#include "source/common/network/raw_buffer_socket.h"
 #include "source/common/network/socket_impl.h"
 #include "source/common/network/utility.h"
 
@@ -38,7 +42,7 @@ Config::Config(const NaiveForwardProxyConfig& proto_config,
     : username_(proto_config.username()), password_(proto_config.password()),
       fast_open_(proto_config.fast_open()),
       max_padding_size_(proto_config.max_padding_size()),
-      dispatcher_(context.mainThreadDispatcher()) {
+      dispatcher_(context.serverFactoryContext().mainThreadDispatcher()) {
   idle_timeout_ = proto_config.has_idle_timeout()
                       ? std::chrono::milliseconds(
                             DurationUtil::durationToMilliseconds(proto_config.idle_timeout()))
@@ -48,19 +52,20 @@ Config::Config(const NaiveForwardProxyConfig& proto_config,
                               DurationUtil::durationToMilliseconds(proto_config.tunnel_timeout()))
                         : kDefaultTunnelTimeout;
 
-  // Create DNS resolver
-  auto& factory =
-      Network::createDnsResolverFactoryFromProto(context.serverFactoryContext().clusterManager()
-                                                     .clusterManagerFactory()
-                                                     .transportSocketFactory(),
-                                                 {});
-  dns_resolver_ = factory.createDnsResolver(dispatcher_, context.api(), {});
+  // Create the default DNS resolver (c-ares). The filter builds its own
+  // upstream, so it only needs a resolver, not a cluster.
+  envoy::config::core::v3::TypedExtensionConfig typed_dns_resolver_config;
+  Network::DnsResolverFactory& factory =
+      Network::createDefaultDnsResolverFactory(typed_dns_resolver_config);
+  dns_resolver_ = THROW_OR_RETURN_VALUE(
+      factory.createDnsResolver(context.serverFactoryContext().mainThreadDispatcher(),
+                                context.serverFactoryContext().api(), typed_dns_resolver_config),
+      Network::DnsResolverSharedPtr);
 }
 
 // ---- Filter ----
 
-NaiveForwardProxyFilter::NaiveForwardProxyFilter(ConfigSharedPtr config)
-    : config_(config), os_syscalls_(Api::OsSysCallsSingleton::get()) {}
+NaiveForwardProxyFilter::NaiveForwardProxyFilter(ConfigSharedPtr config) : config_(config) {}
 
 NaiveForwardProxyFilter::~NaiveForwardProxyFilter() { closeAll(); }
 
@@ -69,7 +74,7 @@ void NaiveForwardProxyFilter::onDestroy() { closeAll(); }
 // ---- decodeHeaders ----
 
 Http::FilterHeadersStatus
-NaiveForwardProxyFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool end_stream) {
+NaiveForwardProxyFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool) {
   if (!Http::HeaderUtility::isConnect(headers)) {
     return Http::FilterHeadersStatus::Continue;
   }
@@ -131,7 +136,10 @@ Http::FilterDataStatus NaiveForwardProxyFilter::decodeData(Buffer::Instance& dat
   if (end_stream) {
     client_half_closed_ = true;
     if (mode_ == Mode::kTcp && tcp_upstream_) {
-      tcp_upstream_->halfClose();
+      // Half-close the upstream by writing end_stream (half-close was enabled
+      // via enableHalfClose(true) on connect).
+      Buffer::OwnedImpl empty;
+      tcp_upstream_->write(empty, true);
     }
     // For UDP, closing the H2 stream means the UoT session is done
     if (mode_ == Mode::kUdp) {
@@ -149,12 +157,12 @@ bool NaiveForwardProxyFilter::authenticate(const Http::RequestHeaderMap& headers
     return true; // No auth required
   }
 
-  const auto* auth = headers.ProxyAuthorization();
-  if (!auth) {
+  const auto auth = headers.get(Http::Headers::get().ProxyAuthorization);
+  if (auth.empty()) {
     return false;
   }
 
-  auto value = auth->value().getStringView();
+  auto value = auth[0]->value().getStringView();
   if (!value.starts_with("Basic ")) {
     return false;
   }
@@ -223,9 +231,9 @@ bool NaiveForwardProxyFilter::extractTarget(const Http::RequestHeaderMap& header
 }
 
 void NaiveForwardProxyFilter::parsePaddingHeader(const Http::RequestHeaderMap& headers) {
-  const auto* padding = headers.getInline(kPaddingHeader);
-  if (padding) {
-    auto value = padding->value().getStringView();
+  const auto padding = headers.get(Http::LowerCaseString(std::string(kPaddingHeader)));
+  if (!padding.empty()) {
+    auto value = padding[0]->value().getStringView();
     if (value.find("variant1") != absl::string_view::npos) {
       padding_enabled_ = true;
     }
@@ -242,8 +250,7 @@ void NaiveForwardProxyFilter::send200OK() {
   auto response = Http::ResponseHeaderMapImpl::create();
   response->setStatus(static_cast<uint64_t>(Http::Code::OK));
   if (padding_enabled_) {
-    response->addCopy(Http::Headers::get().CustomHeaders.at(kPaddingHeader),
-                      "variant1");
+    response->addCopy(Http::LowerCaseString(std::string(kPaddingHeader)), "variant1");
   }
   decoder_callbacks_->encodeHeaders(std::move(response), false,
                                     "naive_forward_proxy_tunnel_established");
@@ -300,9 +307,8 @@ void NaiveForwardProxyFilter::onTcpDnsResolveComplete(
 void NaiveForwardProxyFilter::startTcpConnect(Network::Address::InstanceConstSharedPtr address) {
   state_ = State::kTcpConnecting;
 
-  // Create a plaintext TCP transport socket
-  auto transport_socket =
-      std::make_unique<Network::TransportSocketImpl>(Network::TransportSocketImpl::Type::Raw);
+  // Create a plaintext TCP transport socket for the upstream tunnel.
+  auto transport_socket = std::make_unique<Network::RawBufferSocket>();
 
   tcp_upstream_ = config_->dispatcher().createClientConnection(
       address, nullptr, std::move(transport_socket), nullptr, nullptr);
@@ -529,7 +535,11 @@ void NaiveForwardProxyFilter::createUdpSocket(Network::Address::InstanceConstSha
 
   // Register FileEvent for reads
   udp_file_event_ = config_->dispatcher().createFileEvent(
-      udp_fd_, [this](uint32_t events) { onFileEvent(events); },
+      udp_fd_,
+      [this](uint32_t events) -> absl::Status {
+        onFileEvent(events);
+        return absl::OkStatus();
+      },
       Event::FileTriggerType::EmulatedEdge, Event::FileReadyType::Read);
 
   state_ = State::kTunneling;
@@ -559,7 +569,7 @@ void NaiveForwardProxyFilter::onUdpReadable() {
 
     if (recv_result.return_value_ <= 0) {
       if (recv_result.errno_ != EAGAIN && recv_result.errno_ != EWOULDBLOCK) {
-        ENVOY_LOG(warning, "naive_forward_proxy: UDP recv error: {}", recv_result.errno_);
+        ENVOY_LOG(warn, "naive_forward_proxy: UDP recv error: {}", recv_result.errno_);
       }
       break;
     }
@@ -571,7 +581,7 @@ void NaiveForwardProxyFilter::onUdpReadable() {
     // the full payload, desyncing the client's parser. Drop such datagrams
     // (standard UDP payloads never exceed 65507, so this only guards the edge).
     if (datagram_len > 65535) {
-      ENVOY_LOG(warning, "naive_forward_proxy: oversized UDP datagram ({}B), dropping",
+      ENVOY_LOG(warn, "naive_forward_proxy: oversized UDP datagram ({}B), dropping",
                 datagram_len);
       continue;
     }
@@ -627,14 +637,14 @@ void NaiveForwardProxyFilter::relayUotFrameToUdp(const UotFrame& frame) {
     auto send_result = os_syscalls.send(
         udp_fd_, payload.data(), payload.size(), 0);
     if (send_result.return_value_ < 0) {
-      ENVOY_LOG(warning, "naive_forward_proxy: UDP send error: {}", send_result.errno_);
+      ENVOY_LOG(warn, "naive_forward_proxy: UDP send error: {}", send_result.errno_);
     }
   } else {
     // Unconnected socket: send to frame's destination
     auto address = Network::Utility::parseInternetAddressNoThrow(
         frame.destination.host, frame.destination.port);
     if (!address) {
-      ENVOY_LOG(warning, "naive_forward_proxy: invalid UDP dest: {}:{}",
+      ENVOY_LOG(warn, "naive_forward_proxy: invalid UDP dest: {}:{}",
                 frame.destination.host, frame.destination.port);
       return;
     }
@@ -644,7 +654,7 @@ void NaiveForwardProxyFilter::relayUotFrameToUdp(const UotFrame& frame) {
         udp_fd_, payload.data(), payload.size(), 0,
         reinterpret_cast<const sockaddr*>(&ss), sizeof(ss));
     if (send_result.return_value_ < 0) {
-      ENVOY_LOG(warning, "naive_forward_proxy: UDP sendto error: {}", send_result.errno_);
+      ENVOY_LOG(warn, "naive_forward_proxy: UDP sendto error: {}", send_result.errno_);
     }
   }
 }

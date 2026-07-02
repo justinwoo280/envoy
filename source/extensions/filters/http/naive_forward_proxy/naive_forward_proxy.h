@@ -14,6 +14,7 @@
 #include "envoy/server/factory_context.h"
 
 #include "source/common/common/linked_object.h"
+#include "source/common/common/logger.h"
 #include "source/common/buffer/buffer_impl.h"
 #include "source/extensions/filters/http/common/pass_through_filter.h"
 #include "source/extensions/filters/http/naive_forward_proxy/naive_padding_framer.h"
@@ -48,7 +49,7 @@ private:
   std::chrono::milliseconds idle_timeout_;
   std::chrono::milliseconds tunnel_timeout_;
   Event::Dispatcher& dispatcher_;
-  Network::DnsResolverPtr dns_resolver_;
+  Network::DnsResolverSharedPtr dns_resolver_;
 };
 
 using ConfigSharedPtr = std::shared_ptr<Config>;
@@ -63,7 +64,7 @@ using ConfigSharedPtr = std::shared_ptr<Config>;
 // creates upstream connections (TCP or UDP) to relay traffic.
 class NaiveForwardProxyFilter : public Http::PassThroughDecoderFilter,
                                 public Network::ConnectionCallbacks,
-                                public Event::FileTriggerCb {
+                                Logger::Loggable<Logger::Id::filter> {
 public:
   NaiveForwardProxyFilter(ConfigSharedPtr config);
   ~NaiveForwardProxyFilter() override;
@@ -79,8 +80,8 @@ public:
   void onAboveWriteBufferHighWatermark() override {}
   void onBelowWriteBufferLowWatermark() override {}
 
-  // Event::FileTriggerCb (for UDP socket reads)
-  void onFileEvent(uint32_t events) override;
+  // File event callback for UDP socket reads (registered via createFileEvent).
+  void onFileEvent(uint32_t events);
 
 private:
   enum class Mode { kNone, kTcp, kUdp };
@@ -171,8 +172,7 @@ private:
   bool client_half_closed_ = false;
   bool upstream_half_closed_ = false;
 
-  // UDP upstream
-  Api::OsSysCallsPtr os_syscalls_; // for UDP I/O
+  // UDP upstream (syscalls via Api::OsSysCallsSingleton::get() at each use site)
   int udp_fd_ = -1;
   Event::FileEventPtr udp_file_event_;
   Network::Address::InstanceConstSharedPtr udp_dest_address_;
