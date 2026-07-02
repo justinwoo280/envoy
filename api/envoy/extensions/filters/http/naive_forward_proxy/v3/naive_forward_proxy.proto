@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.http.naive_forward_proxy.v3;
+
+import "google/protobuf/duration.proto";
+
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.filters.http.naive_forward_proxy.v3";
+option java_outer_classname = "NaiveForwardProxyProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/naive_forward_proxy/v3;naive_forward_proxyv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// [#protodoc-title: NaiveProxy forward proxy]
+// [#extension: envoy.filters.http.naive_forward_proxy]
+
+// NaiveForwardProxy implements a NaiveProxy-compatible forward proxy as an
+// Envoy HTTP filter. It intercepts HTTP CONNECT requests, authenticates the
+// client with HTTP Basic credentials, and relays traffic to the requested
+// upstream over TCP (with Variant1 padding) or UDP (UoT v2 framing).
+message NaiveForwardProxy {
+  // HTTP Basic auth username the client must present. If empty, no
+  // authentication is enforced.
+  string username = 1;
+
+  // HTTP Basic auth password the client must present.
+  string password = 2;
+
+  // Enable TCP Fast Open for upstream connections.
+  bool fast_open = 3;
+
+  // Maximum random padding size (bytes) applied to the initial frames of a
+  // proxied stream. Mirrors NaiveProxy's padding behaviour.
+  uint32 max_padding_size = 4 [(validate.rules).uint32 = {lte: 65535}];
+
+  // Idle timeout for an established tunnel with no traffic. Defaults to a
+  // built-in value when unset.
+  google.protobuf.Duration idle_timeout = 5;
+
+  // Overall tunnel timeout. Defaults to a built-in value when unset.
+  google.protobuf.Duration tunnel_timeout = 6;
+}

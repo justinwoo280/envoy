@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package envoy.extensions.transport_sockets.reality.v3;
+
+import "udpa/annotations/status.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.transport_sockets.reality.v3";
+option java_outer_classname = "RealityProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/reality/v3;realityv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// [#protodoc-title: REALITY TLS Mirror]
+// [#extension: envoy.tls_handshakers.reality]
+
+// REALITY implements a TLS mirror server that presents another server's
+// ServerHello fingerprint while performing its own key exchange. This is
+// configured as a ``custom_handshaker`` inside a
+// :ref:`DownstreamTlsContext <envoy_v3_api_msg_extensions.transport_sockets.tls.v3.DownstreamTlsContext>`.
+//
+// The handshaker declares ``provides_certificates``, so Envoy will not load
+// TLS certificates into the SSL_CTX — the handshaker injects a per-connection
+// temporary trusted certificate instead.
+message RealityConfig {
+  // X25519 private key (raw 32 bytes) used for REALITY auth key exchange.
+  // The corresponding public key is distributed to REALITY clients.
+  bytes private_key = 1;
+
+  // Short ID (up to 8 bytes) that the client must present in the encrypted
+  // session_id. Connections with a mismatched short_id are rejected.
+  bytes short_id = 2;
+
+  // Mirror target's ServerHello handshake message (raw bytes, including the
+  // 4-byte handshake header). Captured beforehand from the real target.
+  // The handshaker emits this verbatim (only key_share ciphertext is replaced
+  // with the server's own) to match the target's TLS fingerprint.
+  bytes mirror_server_hello = 3;
+
+  // Maximum allowed absolute difference (in seconds) between the timestamp
+  // embedded in the client's encrypted session_id and the server's current
+  // time. Rejects stale/replayed ClientHellos. Mirrors REALITY's MaxTimeDiff.
+  // If 0, defaults to 90 seconds. Set to a large value to effectively disable.
+  uint32 max_time_diff_seconds = 4;
+}
