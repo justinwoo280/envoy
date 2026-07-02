@@ -1,5 +1,9 @@
 #include "source/extensions/filters/http/naive_forward_proxy/naive_forward_proxy.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -507,11 +511,9 @@ void NaiveForwardProxyFilter::createUdpSocket(Network::Address::InstanceConstSha
     }
     udp_fd_ = sock_result.return_value_;
 
-    // Connect the UDP socket
-    sockaddr_storage ss;
-    address->ip()->asSockAddr(&ss);
-    auto connect_result = os_syscalls.connect(
-        udp_fd_, reinterpret_cast<const sockaddr*>(&ss), sizeof(ss));
+    // Connect the UDP socket. Address already exposes a ready sockaddr.
+    auto connect_result =
+        os_syscalls.connect(udp_fd_, address->sockAddr(), address->sockAddrLen());
     if (connect_result.return_value_ < 0) {
       ENVOY_LOG(error, "naive_forward_proxy: UDP connect failed");
       os_syscalls.close(udp_fd_);
@@ -563,9 +565,18 @@ void NaiveForwardProxyFilter::onUdpReadable() {
 
   while (true) {
     sockaddr_storage peer_addr;
-    socklen_t addr_len = sizeof(peer_addr);
-    auto recv_result = os_syscalls.recvfrom(
-        udp_fd_, buf, kUdpRecvBufSize, 0, reinterpret_cast<sockaddr*>(&peer_addr), &addr_len);
+    // OsSysCalls has no recvfrom(); use recvmsg() to also capture the peer
+    // address (needed for the isConnect=false UoT source-address encoding).
+    iovec iov;
+    iov.iov_base = buf;
+    iov.iov_len = kUdpRecvBufSize;
+    msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = &peer_addr;
+    msg.msg_namelen = sizeof(peer_addr);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    auto recv_result = os_syscalls.recvmsg(udp_fd_, &msg, 0);
 
     if (recv_result.return_value_ <= 0) {
       if (recv_result.errno_ != EAGAIN && recv_result.errno_ != EWOULDBLOCK) {
@@ -633,14 +644,15 @@ void NaiveForwardProxyFilter::relayUotFrameToUdp(const UotFrame& frame) {
   const auto& payload = frame.payload;
 
   if (udp_is_connect_) {
-    // Connected socket: just send
+    // Connected socket: just send. OsSysCalls::send takes a non-const void*.
     auto send_result = os_syscalls.send(
-        udp_fd_, payload.data(), payload.size(), 0);
+        udp_fd_, const_cast<char*>(payload.data()), payload.size(), 0);
     if (send_result.return_value_ < 0) {
       ENVOY_LOG(warn, "naive_forward_proxy: UDP send error: {}", send_result.errno_);
     }
   } else {
-    // Unconnected socket: send to frame's destination
+    // Unconnected socket: send to frame's destination. OsSysCalls has no
+    // sendto(); use sendmsg() with msg_name set to the destination sockaddr.
     auto address = Network::Utility::parseInternetAddressNoThrow(
         frame.destination.host, frame.destination.port);
     if (!address) {
@@ -648,13 +660,20 @@ void NaiveForwardProxyFilter::relayUotFrameToUdp(const UotFrame& frame) {
                 frame.destination.host, frame.destination.port);
       return;
     }
-    sockaddr_storage ss;
-    address->ip()->asSockAddr(&ss);
-    auto send_result = os_syscalls.sendto(
-        udp_fd_, payload.data(), payload.size(), 0,
-        reinterpret_cast<const sockaddr*>(&ss), sizeof(ss));
+    iovec iov;
+    iov.iov_base = const_cast<char*>(payload.data());
+    iov.iov_len = payload.size();
+    msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    // sockAddr() returns a const sockaddr*; msg_name is void* (kernel does not
+    // modify it on send), so the const_cast is safe here.
+    msg.msg_name = const_cast<sockaddr*>(address->sockAddr());
+    msg.msg_namelen = address->sockAddrLen();
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    auto send_result = os_syscalls.sendmsg(udp_fd_, &msg, 0);
     if (send_result.return_value_ < 0) {
-      ENVOY_LOG(warn, "naive_forward_proxy: UDP sendto error: {}", send_result.errno_);
+      ENVOY_LOG(warn, "naive_forward_proxy: UDP sendmsg error: {}", send_result.errno_);
     }
   }
 }
@@ -713,7 +732,7 @@ void NaiveForwardProxyFilter::scheduleIdleTimeout() {
     idle_timer_ = config_->dispatcher().createTimer([this]() {
       ENVOY_LOG(info, "naive_forward_proxy: idle timeout, closing tunnel");
       closeAll();
-      decoder_callbacks_->resetStream(Http::StreamResetReason::IdleTimeout,
+      decoder_callbacks_->resetStream(Http::StreamResetReason::ConnectionTimeout,
                                       "Idle timeout");
     });
   }
