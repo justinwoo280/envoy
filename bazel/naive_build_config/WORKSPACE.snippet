@@ -1,0 +1,20 @@
+# =============================================================================
+# NaiveProxy-REALITY minimal server build: extension allowlist override.
+#
+# HOW TO APPLY (WORKSPACE / non-bzlmod build):
+#   Paste the block below into the top-level `WORKSPACE` file, IMMEDIATELY
+#   BEFORE the `envoy_dependencies()` call. envoy_dependencies() only registers
+#   the default (full ~328-extension) build config when `envoy_build_config`
+#   does not already exist (bazel/repositories.bzl:151), so registering it here
+#   first makes Bazel use OUR minimal allowlist instead. The canonical
+#   source/extensions/extensions_build_config.bzl is left completely untouched.
+# =============================================================================
+
+new_local_repository(
+    name = "envoy_build_config",
+    # Root of this repo = the directory holding our extensions_build_config.bzl.
+    path = "bazel/naive_build_config",
+    # An empty BUILD is all @envoy_build_config needs; the .bzl is loaded by
+    # label "@envoy_build_config//:extensions_build_config.bzl".
+    build_file_content = "",
+)

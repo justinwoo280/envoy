@@ -1,0 +1,114 @@
+# Build the minimal NaiveProxy-REALITY Envoy server on GitHub Actions.
+#
+# Why this exists: DigitalOcean restricted our account to small droplets, and a
+# 4c/8g box OOMs on Envoy. GitHub-hosted runners (4 vCPU / 16 GB) plus the
+# official envoy-build image are a reliable, free alternative and are exactly
+# what upstream CI uses.
+#
+# What it builds: //source/exe:envoy-static with our minimal extension allowlist
+# (bazel/naive_build_config, registered via WORKSPACE) and wasm disabled, then
+# strips it and uploads envoy-min as an artifact.
+#
+# Trigger: push to a branch, or manually via the Actions tab (workflow_dispatch).
+#
+# NOTE: this repo must contain your uncommitted plugin + patches COMMITTED in
+# (they are working-tree changes today). Commit them before pushing, otherwise
+# CI checks out a tree without your naive_forward_proxy filter / reality
+# handshaker / boringssl-reality.patch / naive proto.
+
+name: build-naive-server
+
+on:
+  workflow_dispatch:
+    inputs:
+      compile_mode:
+        description: "bazel -c mode"
+        default: "opt"
+        type: choice
+        options: [opt, fastbuild]
+  push:
+    branches: ["build-naive-*"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # under the 360-min hard cap
+    steps:
+      - name: Checkout (with your committed plugin + patches)
+        uses: actions/checkout@v4
+
+      # Envoy's full build tree + bazel cache easily exceeds the ~14 GB free on
+      # a stock runner. Reclaim ~25 GB by removing preinstalled toolchains we
+      # don't need.
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
+                      /usr/lib/jvm || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Resolve the official envoy build image
+        id: img
+        run: |
+          # ci/envoy_build_sha.sh sets BUILD_CONTAINER to the pinned image.
+          . ./ci/envoy_build_sha.sh
+          echo "image=${BUILD_CONTAINER}" >>"$GITHUB_OUTPUT"
+          echo "Using build image: ${BUILD_CONTAINER}"
+
+      - name: Cache bazel repository + disk cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/bazel-disk
+            ~/.cache/bazel-repo
+          # Cache keyed on dependency pins so it invalidates when deps change.
+          key: bazel-${{ runner.os }}-${{ hashFiles('bazel/repository_locations.bzl', '.bazelversion', 'WORKSPACE') }}
+          restore-keys: |
+            bazel-${{ runner.os }}-
+
+      - name: Build envoy-static (minimal allowlist, wasm disabled)
+        env:
+          IMAGE: ${{ steps.img.outputs.image }}
+          COMPILE_MODE: ${{ github.event.inputs.compile_mode || 'opt' }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.cache/bazel-disk ~/.cache/bazel-repo
+          # Run the build inside the official image so the toolchain matches CI.
+          # Keep --jobs modest so link actions don't OOM on a 16 GB runner.
+          docker run --rm \
+            -v "$PWD":/source -w /source \
+            -v "$HOME/.cache/bazel-disk":/bazel-disk \
+            -v "$HOME/.cache/bazel-repo":/bazel-repo \
+            -e HOME=/tmp \
+            "$IMAGE" \
+            bash -eguxo pipefail -c '
+              bazel build \
+                --config=clang \
+                --disk_cache=/bazel-disk \
+                --repository_cache=/bazel-repo \
+                --jobs=4 \
+                --local_ram_resources=13000 \
+                --define=wasm=disabled \
+                --define=hot_restart=disabled \
+                --define=admin_html=disabled \
+                --define=signal_trace=disabled \
+                --define=deprecated_features=disabled \
+                -c '"$COMPILE_MODE"' \
+                //source/exe:envoy-static
+              strip -s bazel-bin/source/exe/envoy-static -o /source/envoy-min
+              /source/envoy-min --version
+            '
+          ls -lh envoy-min
+
+      - name: Upload envoy-min artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: envoy-min-${{ github.sha }}
+          path: envoy-min
+          if-no-files-found: error
+          retention-days: 14

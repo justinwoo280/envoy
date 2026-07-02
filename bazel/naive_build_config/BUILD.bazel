@@ -1,0 +1,6 @@
+# Empty package marker so bazel/naive_build_config can be exposed as the
+# @envoy_build_config repository (see WORKSPACE override). The bzl file itself
+# is referenced via new_local_repository's build_file below, so no targets are
+# required here.
+
+exports_files(["extensions_build_config.bzl"])

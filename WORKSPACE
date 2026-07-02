@@ -8,6 +8,16 @@ load("//bazel:api_repositories.bzl", "envoy_api_dependencies")
 
 envoy_api_dependencies()
 
+# NaiveProxy-REALITY minimal server build: register our extension allowlist as
+# @envoy_build_config BEFORE envoy_dependencies(), which only falls back to the
+# full default allowlist when this repo is not already defined
+# (bazel/repositories.bzl:151). Canonical extensions_build_config.bzl untouched.
+new_local_repository(
+    name = "envoy_build_config",
+    path = "bazel/naive_build_config",
+    build_file_content = "",
+)
+
 load("//bazel:repositories.bzl", "envoy_dependencies")
 
 envoy_dependencies()
