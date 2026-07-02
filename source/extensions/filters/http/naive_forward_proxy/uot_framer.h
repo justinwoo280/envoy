@@ -132,17 +132,11 @@ private:
     kHandshakePort,
     kDataLen1,
     kDataLen2,
-    kDataAddr,    // isConnect=false: per-frame address
-    kDataAddrData,
-    kDataAddrPort,
+    kDataAddr,    // isConnect=false: per-frame address (decoded in one step)
     kDataPayload,
   };
 
   void setState(State s);
-  bool feedAddress(const uint8_t* data, size_t len, size_t& pos);
-  bool feedPort(const uint8_t* data, size_t len, size_t& pos);
-  bool feedLength(const uint8_t* data, size_t len, size_t& pos);
-  bool feedPayload(const uint8_t* data, size_t len, size_t& pos);
 
   State state_ = State::kHandshakeIsConnect;
   bool handshake_done_ = false;
