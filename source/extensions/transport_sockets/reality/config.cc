@@ -1,6 +1,7 @@
 #include <memory>
 
 #include "envoy/extensions/transport_sockets/reality/v3/reality.pb.h"
+#include "envoy/extensions/transport_sockets/reality/v3/reality.pb.validate.h"
 #include "envoy/registry/registry.h"
 #include "envoy/ssl/handshaker.h"
 
