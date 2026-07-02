@@ -60,6 +60,5 @@ envoy_cc_extension(
         "//envoy/server:filter_config_interface",
         "//source/extensions/filters/http/common:factory_base_lib",
         "@envoy_api//envoy/extensions/filters/http/naive_forward_proxy/v3:pkg_cc_proto",
-        "@envoy_api//envoy/extensions/filters/http/naive_forward_proxy/v3:pkg_cc_proto_validate",
     ],
 )
