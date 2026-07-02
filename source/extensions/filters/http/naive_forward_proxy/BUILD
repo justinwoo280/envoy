@@ -14,7 +14,7 @@ envoy_cc_library(
     srcs = ["uot_framer.cc"],
     hdrs = ["uot_framer.h"],
     deps = [
-        "//source/common/common:byte_order",
+        "//source/common/common:byte_order_lib",
     ],
 )
 
