@@ -705,15 +705,25 @@ void NaiveForwardProxyFilter::closeAll() {
     dns_query_ = nullptr;
   }
 
-  // Close TCP upstream. Remove our ConnectionCallbacks FIRST: close() can
-  // synchronously deliver a LocalClose event, and when closeAll() runs from the
-  // filter destructor that would call a virtual (onEvent) on a half-destroyed
-  // object -> "pure virtual function called" abort. Detaching the callbacks
-  // makes close() safe during destruction.
+  // Close TCP upstream.
+  //
+  // closeAll() is frequently reached from *within* an upstream callback: the
+  // TcpReadFilter's onData() calls relayTcpUpstreamToClient() -> encodeData()
+  // with end_stream, which resets the downstream stream, destroys this filter
+  // (onDestroy/~dtor) and re-enters closeAll(). Destroying tcp_upstream_
+  // synchronously here would free the connection (and the TcpReadFilter that
+  // owns a reference back to us) while the connection's read path is still on
+  // the stack. When control unwinds, the connection code touches its freed
+  // read filter -> "pure virtual function called" abort.
+  //
+  // Fix, mirroring TcpProxy: detach our ConnectionCallbacks so close() cannot
+  // re-enter onEvent(), then hand the connection to deferredDelete() so its
+  // actual destruction happens after the current call stack fully unwinds.
   if (tcp_upstream_) {
     tcp_upstream_->removeConnectionCallbacks(*this);
     tcp_upstream_->close(Network::ConnectionCloseType::NoFlush);
-    tcp_upstream_.reset();
+    config_->dispatcher().deferredDelete(std::move(tcp_upstream_));
+    tcp_upstream_ = nullptr;
   }
 
   // Close UDP socket
