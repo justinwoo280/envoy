@@ -314,7 +314,7 @@ void NaiveForwardProxyFilter::startTcpConnect(Network::Address::InstanceConstSha
   // Create a plaintext TCP transport socket for the upstream tunnel.
   auto transport_socket = std::make_unique<Network::RawBufferSocket>();
 
-  tcp_upstream_ = config_->dispatcher().createClientConnection(
+  tcp_upstream_ = dispatcher().createClientConnection(
       address, nullptr, std::move(transport_socket), nullptr, nullptr);
   tcp_upstream_->enableHalfClose(true);
   tcp_upstream_->addConnectionCallbacks(*this);
@@ -545,7 +545,7 @@ void NaiveForwardProxyFilter::createUdpSocket(Network::Address::InstanceConstSha
   }
 
   // Register FileEvent for reads
-  udp_file_event_ = config_->dispatcher().createFileEvent(
+  udp_file_event_ = dispatcher().createFileEvent(
       udp_fd_,
       [this](uint32_t events) -> absl::Status {
         onFileEvent(events);
@@ -737,7 +737,7 @@ void NaiveForwardProxyFilter::closeAll() {
   if (tcp_upstream_) {
     tcp_upstream_->removeConnectionCallbacks(*this);
     tcp_upstream_->close(Network::ConnectionCloseType::NoFlush);
-    config_->dispatcher().deferredDelete(std::move(tcp_upstream_));
+    dispatcher().deferredDelete(std::move(tcp_upstream_));
     tcp_upstream_ = nullptr;
   }
 
@@ -759,7 +759,7 @@ void NaiveForwardProxyFilter::closeAll() {
 
 void NaiveForwardProxyFilter::scheduleIdleTimeout() {
   if (!idle_timer_) {
-    idle_timer_ = config_->dispatcher().createTimer([this]() {
+    idle_timer_ = dispatcher().createTimer([this]() {
       ENVOY_LOG(info, "naive_forward_proxy: idle timeout, closing tunnel");
       closeAll();
       decoder_callbacks_->resetStream(Http::StreamResetReason::ConnectionTimeout,

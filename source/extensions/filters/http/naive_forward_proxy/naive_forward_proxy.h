@@ -163,6 +163,14 @@ private:
   void closeAll();
   void scheduleIdleTimeout();
 
+  // The worker-thread dispatcher this filter (and its stream) runs on. All
+  // per-stream network objects (upstream connection, file events, timers) and
+  // their deferredDelete MUST use this dispatcher, NOT the main-thread
+  // dispatcher held by Config: using the main-thread dispatcher creates and
+  // tears down connections on a different thread than the one operating them,
+  // corrupting the heap (observed as pure-virtual/SIGSEGV under load).
+  Event::Dispatcher& dispatcher() { return decoder_callbacks_->dispatcher(); }
+
   ConfigSharedPtr config_;
 
   Mode mode_ = Mode::kNone;
