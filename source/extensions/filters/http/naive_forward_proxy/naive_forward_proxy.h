@@ -5,10 +5,13 @@
 #include <optional>
 #include <string>
 
+#include "envoy/api/api.h"
+#include "envoy/config/core/v3/extension.pb.h"
 #include "envoy/extensions/filters/http/naive_forward_proxy/v3/naive_forward_proxy.pb.h"
 #include "envoy/http/filter.h"
 #include "envoy/network/connection.h"
 #include "envoy/network/dns.h"
+#include "envoy/network/dns_resolver.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/event/file_event.h"
 #include "envoy/server/factory_context.h"
@@ -38,8 +41,12 @@ public:
   uint32_t maxPaddingSize() const { return max_padding_size_; }
   std::chrono::milliseconds idleTimeout() const { return idle_timeout_; }
   std::chrono::milliseconds tunnelTimeout() const { return tunnel_timeout_; }
-  Event::Dispatcher& dispatcher() { return dispatcher_; }
-  Network::DnsResolver& dnsResolver() { return *dns_resolver_; }
+
+  // Create a DNS resolver bound to the given (worker-thread) dispatcher. The
+  // resolver MUST live on and be driven by the same thread that calls resolve()
+  // on it; a single shared resolver created on the main thread and used from
+  // workers corrupts the heap (c-ares fd/epoll state is not thread-safe).
+  Network::DnsResolverSharedPtr createDnsResolver(Event::Dispatcher& dispatcher) const;
 
 private:
   std::string username_;
@@ -48,8 +55,10 @@ private:
   uint32_t max_padding_size_;
   std::chrono::milliseconds idle_timeout_;
   std::chrono::milliseconds tunnel_timeout_;
-  Event::Dispatcher& dispatcher_;
-  Network::DnsResolverSharedPtr dns_resolver_;
+  Api::Api& api_;
+  // Declared before the factory because the factory is initialized from it.
+  envoy::config::core::v3::TypedExtensionConfig dns_resolver_config_;
+  Network::DnsResolverFactory& dns_resolver_factory_;
 };
 
 using ConfigSharedPtr = std::shared_ptr<Config>;
@@ -204,7 +213,10 @@ private:
   UotDecoder uot_decoder_;
   bool uot_handshake_echo_sent_ = false;
 
-  // DNS
+  // DNS. The resolver is created lazily on this filter's worker thread (never
+  // shared across threads) and returns the worker-thread-bound resolver.
+  Network::DnsResolver& dnsResolver();
+  Network::DnsResolverSharedPtr dns_resolver_;
   Network::ActiveDnsQuery* dns_query_ = nullptr;
 
   // Idle timer

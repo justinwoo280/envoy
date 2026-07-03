@@ -46,7 +46,8 @@ Config::Config(const NaiveForwardProxyConfig& proto_config,
     : username_(proto_config.username()), password_(proto_config.password()),
       fast_open_(proto_config.fast_open()),
       max_padding_size_(proto_config.max_padding_size()),
-      dispatcher_(context.serverFactoryContext().mainThreadDispatcher()) {
+      api_(context.serverFactoryContext().api()),
+      dns_resolver_factory_(Network::createDefaultDnsResolverFactory(dns_resolver_config_)) {
   idle_timeout_ = proto_config.has_idle_timeout()
                       ? std::chrono::milliseconds(
                             DurationUtil::durationToMilliseconds(proto_config.idle_timeout()))
@@ -55,16 +56,23 @@ Config::Config(const NaiveForwardProxyConfig& proto_config,
                         ? std::chrono::milliseconds(
                               DurationUtil::durationToMilliseconds(proto_config.tunnel_timeout()))
                         : kDefaultTunnelTimeout;
+  // Note: the DNS resolver is NOT created here. It is created per worker thread
+  // via createDnsResolver(), because a c-ares resolver must be created on and
+  // driven by the same thread that resolves against it. See createDnsResolver().
+}
 
-  // Create the default DNS resolver (c-ares). The filter builds its own
-  // upstream, so it only needs a resolver, not a cluster.
-  envoy::config::core::v3::TypedExtensionConfig typed_dns_resolver_config;
-  Network::DnsResolverFactory& factory =
-      Network::createDefaultDnsResolverFactory(typed_dns_resolver_config);
-  dns_resolver_ = THROW_OR_RETURN_VALUE(
-      factory.createDnsResolver(context.serverFactoryContext().mainThreadDispatcher(),
-                                context.serverFactoryContext().api(), typed_dns_resolver_config),
+Network::DnsResolverSharedPtr Config::createDnsResolver(Event::Dispatcher& dispatcher) const {
+  return THROW_OR_RETURN_VALUE(
+      dns_resolver_factory_.createDnsResolver(dispatcher, api_, dns_resolver_config_),
       Network::DnsResolverSharedPtr);
+}
+
+Network::DnsResolver& NaiveForwardProxyFilter::dnsResolver() {
+  // Lazily create a resolver bound to this filter's worker-thread dispatcher.
+  if (!dns_resolver_) {
+    dns_resolver_ = config_->createDnsResolver(dispatcher());
+  }
+  return *dns_resolver_;
 }
 
 // ---- Filter ----
@@ -278,7 +286,7 @@ void NaiveForwardProxyFilter::startTcpDnsResolve() {
   }
 
   // Async DNS resolution
-  dns_query_ = config_->dnsResolver().resolve(
+  dns_query_ = dnsResolver().resolve(
       target_host_, Network::DnsLookupFamily::V4Preferred,
       [this](Network::DnsResolver::ResolutionStatus status, absl::string_view details,
              std::list<Network::DnsResponse>&& response) -> void {
@@ -474,7 +482,7 @@ void NaiveForwardProxyFilter::startUdpDnsResolve(const HostPort& dest) {
     return;
   }
 
-  dns_query_ = config_->dnsResolver().resolve(
+  dns_query_ = dnsResolver().resolve(
       dest.host, Network::DnsLookupFamily::V4Preferred,
       [this](Network::DnsResolver::ResolutionStatus status, absl::string_view details,
              std::list<Network::DnsResponse>&& response) -> void {
