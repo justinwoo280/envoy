@@ -318,7 +318,7 @@ void NaiveForwardProxyFilter::startTcpConnect(Network::Address::InstanceConstSha
       address, nullptr, std::move(transport_socket), nullptr, nullptr);
   tcp_upstream_->enableHalfClose(true);
   tcp_upstream_->addConnectionCallbacks(*this);
-  tcp_upstream_->addReadFilter(std::make_shared<TcpReadFilter>(*this));
+  tcp_upstream_->addReadFilter(std::make_shared<TcpReadFilter>(*this, alive_));
   tcp_upstream_->connect();
 }
 
@@ -698,6 +698,12 @@ uint8_t NaiveForwardProxyFilter::randomPaddingSize() const {
 
 void NaiveForwardProxyFilter::closeAll() {
   state_ = State::kClosed;
+
+  // Mark this filter dead so any callback from the deferred-deleted upstream
+  // connection (TcpReadFilter::onData) that fires after we are gone is a no-op.
+  if (alive_) {
+    *alive_ = false;
+  }
 
   // Cancel DNS
   if (dns_query_) {

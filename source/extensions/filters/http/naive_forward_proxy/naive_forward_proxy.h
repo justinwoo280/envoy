@@ -116,19 +116,30 @@ private:
   void relayClientToTcpUpstream(Buffer::Instance& data, bool end_stream);
   void relayTcpUpstreamToClient(Buffer::Instance& data, bool end_stream);
 
-  // TCP upstream read filter
+  // TCP upstream read filter.
+  //
+  // The upstream connection is torn down via dispatcher().deferredDelete(), so
+  // it (and this read filter) can outlive the owning NaiveForwardProxyFilter,
+  // which the HTTP layer destroys synchronously on stream reset. A raw
+  // back-reference would therefore dangle and any late onData() would invoke a
+  // virtual on a destroyed object ("pure virtual function called"). Guard with
+  // a shared "alive" flag that the parent clears in closeAll()/its destructor.
   class TcpReadFilter : public Network::ReadFilter {
   public:
-    TcpReadFilter(NaiveForwardProxyFilter& parent) : parent_(parent) {}
+    TcpReadFilter(NaiveForwardProxyFilter& parent, std::shared_ptr<bool> alive)
+        : parent_(parent), alive_(std::move(alive)) {}
     Network::FilterStatus onNewConnection() override { return Network::FilterStatus::Continue; }
     Network::FilterStatus onData(Buffer::Instance& data, bool end_stream) override {
-      parent_.relayTcpUpstreamToClient(data, end_stream);
+      if (alive_ && *alive_) {
+        parent_.relayTcpUpstreamToClient(data, end_stream);
+      }
       return Network::FilterStatus::StopIteration;
     }
     void initializeReadFilterCallbacks(Network::ReadFilterCallbacks&) override {}
 
   private:
     NaiveForwardProxyFilter& parent_;
+    std::shared_ptr<bool> alive_;
   };
 
   // ---- UDP path ----
@@ -165,6 +176,10 @@ private:
   bool padding_enabled_ = false;
   PaddingFramer padding_decoder_; // client → server (strip)
   PaddingFramer padding_encoder_; // server → client (add)
+
+  // Shared liveness flag handed to TcpReadFilter so a deferred-deleted upstream
+  // connection's late callbacks become no-ops after this filter is destroyed.
+  std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
 
   // TCP upstream
   Network::ClientConnectionPtr tcp_upstream_;
