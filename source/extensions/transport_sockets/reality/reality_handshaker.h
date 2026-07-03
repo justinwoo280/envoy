@@ -55,6 +55,8 @@ private:
   // Computed per-connection
   std::vector<uint8_t> auth_key_;       // 32 bytes, derived HKDF key
   std::vector<uint8_t> temp_cert_;      // modified cert DER
+  std::vector<uint8_t> client_session_id_; // client's ClientHello session_id (echo in SH)
+  std::vector<uint8_t> mirror_sh_;      // per-conn mirror ServerHello with session_id echoed
 };
 
 } // namespace Reality

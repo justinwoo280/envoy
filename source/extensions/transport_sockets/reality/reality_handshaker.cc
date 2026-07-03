@@ -1,5 +1,7 @@
 #include "source/extensions/transport_sockets/reality/reality_handshaker.h"
 
+#include <cstring>
+
 #include <openssl/aes.h>
 #include <openssl/curve25519.h>
 #include <openssl/evp.h>
@@ -87,8 +89,19 @@ bool RealityHandshaker::onRealityServerHello(const uint8_t** out, size_t* out_le
   if (sh.empty()) {
     return false;
   }
-  *out = sh.data();
-  *out_len = sh.size();
+  // Work on a per-connection copy so we can echo this client's session_id.
+  mirror_sh_ = sh;
+  // ServerHello layout: header(4) + legacy_version(2) + random(32) +
+  // session_id_len(1) at offset 38, then session_id. TLS 1.3 requires the
+  // ServerHello's legacy_session_id_echo to equal the ClientHello's
+  // legacy_session_id; the captured mirror still holds the original target's
+  // session_id, so overwrite it with this client's (must both be 32 bytes).
+  if (client_session_id_.size() == 32 && mirror_sh_.size() >= 39 + 32 &&
+      mirror_sh_[38] == 32) {
+    std::memcpy(mirror_sh_.data() + 39, client_session_id_.data(), 32);
+  }
+  *out = mirror_sh_.data();
+  *out_len = mirror_sh_.size();
   return true;
 }
 
@@ -206,6 +219,12 @@ bool RealityHandshaker::extractAndVerifyAuth(const SSL_CLIENT_HELLO* client_hell
   if (client_hello->session_id_len != 32) {
     return false;
   }
+  // Remember the client's legacy_session_id so the mirrored ServerHello can
+  // echo it (TLS 1.3 requires legacy_session_id_echo == ClientHello's, and the
+  // captured mirror carries the ORIGINAL target's session_id, which would
+  // otherwise break the client's handshake with a bad record MAC).
+  client_session_id_.assign(client_hello->session_id,
+                            client_hello->session_id + client_hello->session_id_len);
 
   // AAD = handshake header (type=0x01 + 3-byte length) + client_hello body
   std::vector<uint8_t> aad;
