@@ -75,6 +75,9 @@ jobs:
           # Run inside the official image via the official wrapper. Bazel caches
           # live under /build (the mounted ENVOY_DOCKER_BUILD_DIR). --jobs modest
           # so link actions don't OOM on a 16 GB runner.
+          # strip into /build (writable by the envoybuild user and mounted to
+          # the host at /tmp/envoy-docker-build); copying to /source (repo root)
+          # can fail on permissions. We fetch it from the host mount afterwards.
           ./ci/run_envoy_docker.sh "
             bazel build \
               --config=clang \
@@ -89,8 +92,11 @@ jobs:
               --define=deprecated_features=disabled \
               -c ${COMPILE_MODE} \
               //source/exe:envoy-static \
-            && strip -s bazel-bin/source/exe/envoy-static -o /source/envoy-min \
-            && /source/envoy-min --version"
+            && strip -s bazel-bin/source/exe/envoy-static -o /build/envoy-min \
+            && /build/envoy-min --version \
+            && ls -lh /build/envoy-min"
+          # /build inside the container == /tmp/envoy-docker-build on the host.
+          cp /tmp/envoy-docker-build/envoy-min ./envoy-min
           ls -lh envoy-min
 
       - name: Upload envoy-min artifact
