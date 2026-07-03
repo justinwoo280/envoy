@@ -24,8 +24,6 @@ private:
       const envoy::extensions::filters::http::naive_forward_proxy::v3::NaiveForwardProxy&
           proto_config,
       const std::string& stats_prefix, Server::Configuration::FactoryContext& context) override;
-
-  LinkMode mode() const override { return LinkMode::Strict; }
 };
 
 } // namespace NaiveForwardProxy
