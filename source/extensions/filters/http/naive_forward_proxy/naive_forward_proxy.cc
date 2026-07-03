@@ -370,6 +370,18 @@ void NaiveForwardProxyFilter::relayClientToTcpUpstream(Buffer::Instance& data, b
 }
 
 void NaiveForwardProxyFilter::relayTcpUpstreamToClient(Buffer::Instance& data, bool end_stream) {
+  // IMPORTANT: encodeData() with end_stream=true can synchronously reset the
+  // downstream stream, which destroys THIS filter before encodeData() returns.
+  // Therefore update all member state BEFORE calling encodeData(), and never
+  // touch any member (including implicit `this`) afterwards on the end_stream
+  // path. Reordering here removes a use-after-free that manifested under load
+  // as alternating "pure virtual function called" / SIGSEGV during bursts of
+  // concurrent stream teardown.
+  if (end_stream) {
+    upstream_half_closed_ = true;
+    state_ = State::kClosed;
+  }
+
   if (padding_enabled_ && padding_encoder_.encodePaddingActive()) {
     // Add padding
     auto* bytes = reinterpret_cast<const uint8_t*>(data.linearize(data.length()));
@@ -378,14 +390,11 @@ void NaiveForwardProxyFilter::relayTcpUpstreamToClient(Buffer::Instance& data, b
     Buffer::OwnedImpl buf;
     buf.add(padded.data(), padded.size());
     decoder_callbacks_->encodeData(buf, end_stream);
-  } else {
-    decoder_callbacks_->encodeData(data, end_stream);
+    // do not touch members past this point on the end_stream path
+    return;
   }
-
-  if (end_stream) {
-    upstream_half_closed_ = true;
-    state_ = State::kClosed;
-  }
+  decoder_callbacks_->encodeData(data, end_stream);
+  // do not touch members past this point on the end_stream path
 }
 
 // ---- UDP path ----

@@ -85,6 +85,7 @@ jobs:
           ./ci/run_envoy_docker.sh ci/naive_build_in_docker.sh
           # /build inside the container == /tmp/envoy-docker-build on the host.
           cp /tmp/envoy-docker-build/envoy-min ./envoy-min
+          cp /tmp/envoy-docker-build/envoy-unstripped ./envoy-unstripped || true
           ls -lh envoy-min
 
       - name: Upload envoy-min artifact
@@ -93,4 +94,12 @@ jobs:
           name: envoy-min-${{ github.sha }}
           path: envoy-min
           if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload unstripped envoy (diagnostics)
+        uses: actions/upload-artifact@v4
+        with:
+          name: envoy-unstripped-${{ github.sha }}
+          path: envoy-unstripped
+          if-no-files-found: warn
           retention-days: 14

@@ -26,5 +26,8 @@ bazel build \
   //source/exe:envoy-static
 
 strip -s bazel-bin/source/exe/envoy-static -o /build/envoy-min
+# Also keep an UNSTRIPPED copy for symbolized crash backtraces (diagnostics).
+cp bazel-bin/source/exe/envoy-static /build/envoy-unstripped || true
 /build/envoy-min --version
 ls -lh /build/envoy-min
+ls -lh /build/envoy-unstripped || true
