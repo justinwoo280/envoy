@@ -705,8 +705,13 @@ void NaiveForwardProxyFilter::closeAll() {
     dns_query_ = nullptr;
   }
 
-  // Close TCP upstream
+  // Close TCP upstream. Remove our ConnectionCallbacks FIRST: close() can
+  // synchronously deliver a LocalClose event, and when closeAll() runs from the
+  // filter destructor that would call a virtual (onEvent) on a half-destroyed
+  // object -> "pure virtual function called" abort. Detaching the callbacks
+  // makes close() safe during destruction.
   if (tcp_upstream_) {
+    tcp_upstream_->removeConnectionCallbacks(*this);
     tcp_upstream_->close(Network::ConnectionCloseType::NoFlush);
     tcp_upstream_.reset();
   }
