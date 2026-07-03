@@ -30,13 +30,67 @@ diff -ruN a/ssl/tls13_server.cc b/ssl/tls13_server.cc
  BSSL_NAMESPACE_BEGIN
  
  static const uint8_t kZeroes[EVP_MAX_MD_SIZE] = {0};
-@@ -989,62 +994,136 @@
+@@ -396,6 +401,50 @@
+     return ssl_hs_error;
+   }
+ 
++  // === REALITY: adopt the mirror target's cipher suite ===
++  // When a ServerHello mirror is configured, the emitted ServerHello carries
++  // the target's cipher_suite. TLS 1.3 derives the transcript hash and traffic
++  // secrets from hs->new_cipher, which is initialized (transcript.InitHash)
++  // shortly after this point. If the server negotiated a different cipher than
++  // the mirror advertises (e.g. AES-128 locally vs the target's AES-256), the
++  // client and server would hash with different digests -> BAD_DECRYPT. So,
++  // like REALITY's Go implementation (handshake_server_tls13.go: hs.suite =
++  // cipherSuiteTLS13ByID(hs.hello.cipherSuite)), override new_cipher with the
++  // mirror's, but only if the client actually offered it.
++  if (::reality_serverhello_cb != nullptr) {
++    const uint8_t *mirror = nullptr;
++    size_t mirror_len = 0;
++    if (::reality_serverhello_cb(ssl, &mirror, &mirror_len) && mirror != nullptr) {
++      // ServerHello: header(4) ver(2) random(32) sid_len(1) sid cipher(2)
++      size_t co = 4 + 2 + 32;
++      if (mirror_len > co && mirror_len >= co + 1u + mirror[co] + 2u) {
++        co += 1 + mirror[co];
++        uint16_t mirror_cipher = (uint16_t(mirror[co]) << 8) | mirror[co + 1];
++        // Confirm the client offered this cipher before adopting it.
++        CBS cs;
++        CBS_init(&cs, client_hello.cipher_suites, client_hello.cipher_suites_len);
++        bool offered = false;
++        while (CBS_len(&cs) >= 2) {
++          uint16_t id;
++          if (!CBS_get_u16(&cs, &id)) {
++            break;
++          }
++          if (id == mirror_cipher) {
++            offered = true;
++            break;
++          }
++        }
++        const uint16_t proto_version = ssl_protocol_version(ssl);
++        const SSL_CIPHER *mc = SSL_get_cipher_by_value(mirror_cipher);
++        if (offered && mc != nullptr &&
++            SSL_CIPHER_get_min_version(mc) <= proto_version &&
++            SSL_CIPHER_get_max_version(mc) >= proto_version) {
++          hs->new_cipher = mc;
++        }
++      }
++    }
++  }
++
+   // Select the credential to use.
+   Array<SSL_CREDENTIAL *> creds;
+   if (!ssl_get_full_credential_list(hs, &creds)) {
+@@ -989,62 +1038,139 @@
    return ssl_hs_ok;
  }
  
 +// REALITY: replace the key_share extension's ciphertext in a ServerHello in
-+// place. Assumes the same group (and thus same ciphertext length), which holds
-+// when both sides use X25519. Returns false on any parse/length mismatch.
++// place. This is group-agnostic: it only requires that our own key-share
++// ciphertext length matches the mirror target's server_share length, which
++// holds because both sides negotiate the same group (plain X25519 or the
++// post-quantum hybrid X25519MLKEM768). Returns false on any parse/length
++// mismatch.
 +static bool reality_replace_key_share(Array<uint8_t> *sh,
 +                                      Span<const uint8_t> new_ks) {
 +  uint8_t *p = sh->data();
@@ -212,7 +266,7 @@ diff -ruN a/ssl/tls13_server.cc b/ssl/tls13_server.cc
    }
  
    if (!ssl->method->add_message(ssl, std::move(server_hello))) {
-@@ -1603,3 +1682,16 @@
+@@ -1603,3 +1729,16 @@
  }
  
  BSSL_NAMESPACE_END
