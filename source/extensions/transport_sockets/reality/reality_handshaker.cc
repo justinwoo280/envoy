@@ -326,6 +326,16 @@ bool RealityHandshaker::injectPrivateKey() {
     ENVOY_LOG(error, "REALITY SSL_use_PrivateKey failed");
     return false;
   }
+  // The injected leaf is an Ed25519 cert, so the server's CertificateVerify
+  // must be signed with Ed25519. Because the handshaker declares
+  // provides_sigalgs=true, BoringSSL does NOT auto-configure the server signing
+  // prefs; without this the handshake fails with NO_COMMON_SIGNATURE_ALGORITHMS
+  // right after REALITY auth succeeds.
+  static const uint16_t kEd25519[] = {SSL_SIGN_ED25519};
+  if (SSL_set_signing_algorithm_prefs(ssl_.get(), kEd25519, 1) != 1) {
+    ENVOY_LOG(error, "REALITY SSL_set_signing_algorithm_prefs failed");
+    return false;
+  }
   return true;
 }
 
