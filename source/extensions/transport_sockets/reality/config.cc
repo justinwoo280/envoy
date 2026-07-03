@@ -29,9 +29,13 @@ public:
   createHandshakerCb(const Protobuf::Message& config,
                      Ssl::HandshakerFactoryContext& /*context*/,
                      ProtobufMessage::ValidationVisitor& validation_visitor) override {
-    const auto& proto = MessageUtil::downcastAndValidate<
-        const envoy::extensions::transport_sockets::reality::v3::RealityConfig&>(
-        config, validation_visitor);
+    // Envoy passes the raw google.protobuf.Any from TypedExtensionConfig
+    // .typed_config here (context_config_impl.cc, has_custom_handshaker path),
+    // NOT a concrete RealityConfig. dynamic_cast-ing the Any directly to
+    // RealityConfig throws std::bad_cast, so unpack the Any first.
+    const auto proto = MessageUtil::anyConvertAndValidate<
+        envoy::extensions::transport_sockets::reality::v3::RealityConfig>(
+        dynamic_cast<const Protobuf::Any&>(config), validation_visitor);
 
     auto reality_config = std::make_shared<RealityConfig>(proto);
 
