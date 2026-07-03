@@ -78,23 +78,11 @@ jobs:
           # strip into /build (writable by the envoybuild user and mounted to
           # the host at /tmp/envoy-docker-build); copying to /source (repo root)
           # can fail on permissions. We fetch it from the host mount afterwards.
-          ./ci/run_envoy_docker.sh "
-            bazel build \
-              --config=clang \
-              --disk_cache=/build/bazel-disk \
-              --repository_cache=/build/bazel-repo \
-              --jobs=4 \
-              --local_ram_resources=13000 \
-              --define=wasm=disabled \
-              --define=hot_restart=disabled \
-              --define=admin_html=disabled \
-              --define=signal_trace=disabled \
-              --define=deprecated_features=disabled \
-              -c ${COMPILE_MODE} \
-              //source/exe:envoy-static \
-            && strip -s bazel-bin/source/exe/envoy-static -o /build/envoy-min \
-            && /build/envoy-min --version \
-            && ls -lh /build/envoy-min"
+          # Invoke a single-word command (the script) so it survives the
+          # wrapper's unquoted `exec $DOCKER_COMMAND` word-splitting. The script
+          # builds + strips to /build/envoy-min (mounted to the host at
+          # /tmp/envoy-docker-build), which we copy out below.
+          ./ci/run_envoy_docker.sh ci/naive_build_in_docker.sh
           # /build inside the container == /tmp/envoy-docker-build on the host.
           cp /tmp/envoy-docker-build/envoy-min ./envoy-min
           ls -lh envoy-min
