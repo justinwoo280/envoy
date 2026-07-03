@@ -30,7 +30,7 @@ diff -ruN a/ssl/tls13_server.cc b/ssl/tls13_server.cc
  BSSL_NAMESPACE_BEGIN
  
  static const uint8_t kZeroes[EVP_MAX_MD_SIZE] = {0};
-@@ -989,62 +994,136 @@
+@@ -989,62 +994,140 @@
    return ssl_hs_ok;
  }
  
@@ -73,6 +73,10 @@ diff -ruN a/ssl/tls13_server.cc b/ssl/tls13_server.cc
 +      if (4 + key_len != elen || key_len != new_ks.size()) {
 +        return false;
 +      }
++      fprintf(stderr, "REALITY_SRV_DBG inject_ks[0..8]=");
++      for (size_t i = 0; i < 8 && i < new_ks.size(); i++)
++        fprintf(stderr, "%02x", new_ks.data()[i]);
++      fprintf(stderr, " ks_len=%zu\n", new_ks.size());
 +      OPENSSL_memcpy(p + off + 4, new_ks.data(), new_ks.size());
 +      return true;
 +    }
