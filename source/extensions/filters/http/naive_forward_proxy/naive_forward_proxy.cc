@@ -224,13 +224,21 @@ bool NaiveForwardProxyFilter::extractTarget(const Http::RequestHeaderMap& header
   if (colon != absl::string_view::npos) {
     // Port comes from the untrusted :authority. std::stoi would THROW on
     // non-numeric or out-of-range input (a crash/DoS vector). Parse safely and
-    // validate the 1..65535 range.
+    // validate the range.
     uint32_t port = 0;
     auto port_str = authority.substr(colon + 1);
-    if (!absl::SimpleAtoi(port_str, &port) || port == 0 || port > 65535) {
+    if (!absl::SimpleAtoi(port_str, &port) || port > 65535) {
       return false;
     }
     target_host_ = std::string(authority.substr(0, colon));
+    // Port 0 is normally rejected (bogus for a TCP CONNECT), but the UoT magic
+    // address is always requested with port 0 by the naive client because the
+    // real per-datagram destination travels inside the UoT frames, not in the
+    // CONNECT authority. Accept port 0 only for the UoT magic hosts; the value
+    // is unused for UDP mode. For any other host, port 0 is still an error.
+    if (port == 0 && !isUotRequest()) {
+      return false;
+    }
     target_port_ = static_cast<uint16_t>(port);
   } else {
     target_host_ = std::string(authority);
