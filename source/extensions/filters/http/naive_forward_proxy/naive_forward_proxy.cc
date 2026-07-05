@@ -708,6 +708,11 @@ void NaiveForwardProxyFilter::relayUotFrameToUdp(const UotFrame& frame) {
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
     auto send_result = os_syscalls.sendmsg(udp_fd_, &msg, 0);
+    ENVOY_LOG(info,
+              "naive_forward_proxy: UoT DIAG sendmsg fd={} to={} namelen={} "
+              "payload={} rv={} errno={}",
+              udp_fd_, address->asString(), msg.msg_namelen, payload.size(),
+              send_result.return_value_, send_result.errno_);
     if (send_result.return_value_ < 0) {
       ENVOY_LOG(warn, "naive_forward_proxy: UDP sendmsg error: {}", send_result.errno_);
     }
