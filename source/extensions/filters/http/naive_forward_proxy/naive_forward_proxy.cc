@@ -530,12 +530,12 @@ void NaiveForwardProxyFilter::createUdpSocket(Network::Address::InstanceConstSha
   // For isConnect=true: connected UDP socket (one destination)
   // For isConnect=false: unconnected UDP socket (multiple destinations)
   if (udp_is_connect_) {
-    // Connected UDP socket
+    // Connected UDP socket (non-blocking: driven by the dispatcher's FileEvent).
     auto& os_syscalls = Api::OsSysCallsSingleton::get();
     auto sock_result = os_syscalls.socket(address->ip()->version() == Network::Address::IpVersion::v4
                                                ? AF_INET
                                                : AF_INET6,
-                                           SOCK_DGRAM, IPPROTO_UDP);
+                                           SOCK_DGRAM | SOCK_NONBLOCK, IPPROTO_UDP);
     if (sock_result.return_value_ < 0) {
       ENVOY_LOG(error, "naive_forward_proxy: failed to create UDP socket");
       decoder_callbacks_->resetStream(Http::StreamResetReason::ConnectError,
@@ -556,9 +556,13 @@ void NaiveForwardProxyFilter::createUdpSocket(Network::Address::InstanceConstSha
       return;
     }
   } else {
-    // Unconnected UDP socket
+    // Unconnected UDP socket. Create it non-blocking: Envoy's dispatcher drives
+    // it via an edge-triggered FileEvent and onUdpReadable() loops recvmsg until
+    // EAGAIN, so a blocking fd would stall the whole worker thread on the last
+    // recvmsg.
     auto& os_syscalls = Api::OsSysCallsSingleton::get();
-    auto sock_result = os_syscalls.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    auto sock_result =
+        os_syscalls.socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, IPPROTO_UDP);
     if (sock_result.return_value_ < 0) {
       ENVOY_LOG(error, "naive_forward_proxy: failed to create UDP socket");
       decoder_callbacks_->resetStream(Http::StreamResetReason::ConnectError,
@@ -585,6 +589,7 @@ void NaiveForwardProxyFilter::createUdpSocket(Network::Address::InstanceConstSha
 }
 
 void NaiveForwardProxyFilter::onFileEvent(uint32_t events) {
+  ENVOY_LOG(info, "naive_forward_proxy: UoT DIAG onFileEvent events={}", events);
   if (events & Event::FileReadyType::Read) {
     onUdpReadable();
   }
