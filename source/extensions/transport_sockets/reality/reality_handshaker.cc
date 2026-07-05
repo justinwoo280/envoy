@@ -82,15 +82,21 @@ bool RealityHandshaker::realityServerHelloCb_(SSL* ssl, const uint8_t** out, siz
 }
 
 // ---------------------------------------------------------------------------
-// onRealityServerHello — return the pre-configured mirror ServerHello bytes
+// onRealityServerHello — return the mirror ServerHello bytes to emit.
+//
+// Prefers a live-captured ServerHello (mirror_sh_, filled by
+// onMirrorDialComplete in live mode). Falls back to the static
+// mirror_server_hello from config (static mode, or when the live dial failed).
 // ---------------------------------------------------------------------------
 bool RealityHandshaker::onRealityServerHello(const uint8_t** out, size_t* out_len) {
-  const auto& sh = config_->mirrorServerHello();
-  if (sh.empty()) {
-    return false;
+  if (mirror_sh_.empty()) {
+    // No live capture available: use the static fallback.
+    const auto& sh = config_->mirrorServerHello();
+    if (sh.empty()) {
+      return false;
+    }
+    mirror_sh_ = sh;
   }
-  // Work on a per-connection copy so we can echo this client's session_id.
-  mirror_sh_ = sh;
   // ServerHello layout: header(4) + legacy_version(2) + random(32) +
   // session_id_len(1) at offset 38, then session_id. TLS 1.3 requires the
   // ServerHello's legacy_session_id_echo to equal the ClientHello's
@@ -111,8 +117,12 @@ bool RealityHandshaker::onRealityServerHello(const uint8_t** out, size_t* out_le
 ssl_select_cert_result_t RealityHandshaker::onSelectCertificate(
     const SSL_CLIENT_HELLO* client_hello) {
   if (state_ == State::AuthDone) {
-    // Second call: auth already done, proceed with handshake
+    // Resumed call: auth (and any live mirror dial) already done.
     return ssl_select_cert_success;
+  }
+  if (state_ == State::MirrorPending) {
+    // The live mirror dial is still in flight; keep the handshake suspended.
+    return ssl_select_cert_retry;
   }
 
   // First call: extract REALITY auth
@@ -127,8 +137,80 @@ ssl_select_cert_result_t RealityHandshaker::onSelectCertificate(
     return ssl_select_cert_error;
   }
 
+  // Live mirror: suspend the handshake, dial the real target asynchronously to
+  // capture its ServerHello, then resume. If the dial cannot be started, fall
+  // through to static mode.
+  if (config_->hasLiveMirror() && startLiveMirrorDial()) {
+    state_ = State::MirrorPending;
+    return ssl_select_cert_retry;
+  }
+
+  // Static mode (or live dial could not start): proceed immediately. The
+  // reality_serverhello_cb will use the static mirror_server_hello.
   state_ = State::AuthDone;
   return ssl_select_cert_success;
+}
+
+Network::DnsResolver& RealityHandshaker::dnsResolver() {
+  if (dns_resolver_ == nullptr) {
+    // Build a per-worker resolver on this connection's dispatcher. A c-ares
+    // resolver must be created and driven on the same thread that resolves.
+    dns_resolver_ = config_->createDnsResolver(handshakeCallbacks()->connection().dispatcher());
+  }
+  return *dns_resolver_;
+}
+
+bool RealityHandshaker::startLiveMirrorDial() {
+  auto* cb = handshakeCallbacks();
+  if (cb == nullptr) {
+    return false;
+  }
+  Event::Dispatcher& dispatcher = cb->connection().dispatcher();
+
+  // Parse "host:port" from the configured target.
+  const std::string& target = config_->mirrorTarget();
+  const auto colon = target.rfind(':');
+  if (colon == std::string::npos) {
+    return false;
+  }
+  std::string host = target.substr(0, colon);
+  uint32_t port = 0;
+  try {
+    port = static_cast<uint32_t>(std::stoul(target.substr(colon + 1)));
+  } catch (...) {
+    return false;
+  }
+  if (host.empty() || port == 0 || port > 65535) {
+    return false;
+  }
+
+  // Ensure the per-worker resolver exists, then hand its shared_ptr to the
+  // dialer (keeps it alive for the dial's lifetime).
+  dnsResolver();
+  const auto timeout = std::chrono::seconds(config_->mirrorDialTimeoutSeconds());
+  mirror_dialer_ = std::make_unique<MirrorDialer>(
+      dispatcher, dns_resolver_, std::move(host), port, negotiated_group_,
+      std::chrono::duration_cast<std::chrono::milliseconds>(timeout),
+      [this](std::vector<uint8_t>&& sh) { onMirrorDialComplete(std::move(sh)); });
+  mirror_dialer_->start();
+  return true;
+}
+
+void RealityHandshaker::onMirrorDialComplete(std::vector<uint8_t>&& server_hello) {
+  if (!server_hello.empty()) {
+    // Adopt the live-captured ServerHello; onRealityServerHello will fix up the
+    // session_id and the patch replaces the key_share.
+    mirror_sh_ = std::move(server_hello);
+    ENVOY_LOG(debug, "REALITY live mirror captured: {} bytes", mirror_sh_.size());
+  } else {
+    // Live capture failed: leave mirror_sh_ empty so onRealityServerHello falls
+    // back to the static config (if present).
+    ENVOY_LOG(debug, "REALITY live mirror failed; falling back to static ServerHello");
+  }
+  state_ = State::AuthDone;
+  mirror_dialer_.reset();
+  // Resume the suspended client-facing handshake.
+  handshakeCallbacks()->onAsynchronousCertificateSelectionComplete();
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +262,7 @@ bool RealityHandshaker::extractAndVerifyAuth(const SSL_CLIENT_HELLO* client_hell
     (void)key_len;
     if (group == SSL_CURVE_X25519 && CBS_len(&key_data) == 32) {
       peer_pub.assign(CBS_data(&key_data), CBS_data(&key_data) + 32);
+      negotiated_group_ = SSL_CURVE_X25519;
       break; // plain X25519 preferred; stop searching
     }
     if (group == kGroupX25519Mlkem768 && CBS_len(&key_data) == kHybridKeyShareLen &&
@@ -187,6 +270,7 @@ bool RealityHandshaker::extractAndVerifyAuth(const SSL_CLIENT_HELLO* client_hell
       // X25519 public value is the trailing 32 bytes.
       const uint8_t* x = CBS_data(&key_data) + kMlkem768PublicKeyBytes;
       hybrid_x25519.assign(x, x + 32);
+      negotiated_group_ = kGroupX25519Mlkem768;
       // keep scanning in case a plain X25519 share also appears
     }
   }

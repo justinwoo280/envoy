@@ -11,6 +11,7 @@
 #include "envoy/common/exception.h"
 
 #include "source/common/common/fmt.h"
+#include "source/common/network/dns_resolver/dns_factory_util.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -18,11 +19,14 @@ namespace TransportSockets {
 namespace Reality {
 
 RealityConfig::RealityConfig(
-    const envoy::extensions::transport_sockets::reality::v3::RealityConfig& proto) {
+    const envoy::extensions::transport_sockets::reality::v3::RealityConfig& proto, Api::Api& api)
+    : api_(api),
+      dns_resolver_factory_(Network::createDefaultDnsResolverFactory(dns_resolver_config_)) {
   private_key_ = std::vector<uint8_t>(proto.private_key().begin(), proto.private_key().end());
   short_id_ = std::vector<uint8_t>(proto.short_id().begin(), proto.short_id().end());
   mirror_server_hello_ =
       std::vector<uint8_t>(proto.mirror_server_hello().begin(), proto.mirror_server_hello().end());
+  mirror_target_ = proto.mirror_target();
 
   // Validate the X25519 private key length. A wrong length would silently
   // produce a garbage shared secret (and thus break auth) or read OOB.
@@ -37,15 +41,33 @@ RealityConfig::RealityConfig(
     throw EnvoyException(fmt::format(
         "REALITY short_id must be 1..8 bytes, got {}", short_id_.size()));
   }
-  if (mirror_server_hello_.empty()) {
-    throw EnvoyException("REALITY mirror_server_hello must be set");
+  // At least one mirror source must be configured: a live target to dial, or a
+  // static ServerHello to emit (also used as the live-capture fallback).
+  if (mirror_server_hello_.empty() && mirror_target_.empty()) {
+    throw EnvoyException(
+        "REALITY requires at least one of mirror_server_hello or mirror_target");
+  }
+  // Basic host:port sanity for the live target.
+  if (!mirror_target_.empty() && mirror_target_.find(':') == std::string::npos) {
+    throw EnvoyException(fmt::format(
+        "REALITY mirror_target must be host:port, got '{}'", mirror_target_));
   }
 
+  if (proto.mirror_dial_timeout_seconds() != 0) {
+    mirror_dial_timeout_seconds_ = proto.mirror_dial_timeout_seconds();
+  }
   if (proto.max_time_diff_seconds() != 0) {
     max_time_diff_seconds_ = proto.max_time_diff_seconds();
   }
 
   generateEd25519();
+}
+
+Network::DnsResolverSharedPtr
+RealityConfig::createDnsResolver(Event::Dispatcher& dispatcher) const {
+  return THROW_OR_RETURN_VALUE(
+      dns_resolver_factory_.createDnsResolver(dispatcher, api_, dns_resolver_config_),
+      Network::DnsResolverSharedPtr);
 }
 
 void RealityConfig::generateEd25519() {

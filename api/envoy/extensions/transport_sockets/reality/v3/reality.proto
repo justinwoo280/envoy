@@ -30,10 +30,13 @@ message RealityConfig {
   // session_id. Connections with a mismatched short_id are rejected.
   bytes short_id = 2;
 
-  // Mirror target's ServerHello handshake message (raw bytes, including the
-  // 4-byte handshake header). Captured beforehand from the real target.
-  // The handshaker emits this verbatim (only key_share ciphertext is replaced
-  // with the server's own) to match the target's TLS fingerprint.
+  // Static fallback mirror ServerHello handshake message (raw bytes, including
+  // the 4-byte handshake header). Captured beforehand from the real target.
+  // Used when ``mirror_target`` is unset, or as a fallback when a live capture
+  // fails. The handshaker emits this verbatim (only key_share ciphertext is
+  // replaced with the server's own) to match the target's TLS fingerprint.
+  //
+  // At least one of ``mirror_server_hello`` or ``mirror_target`` must be set.
   bytes mirror_server_hello = 3;
 
   // Maximum allowed absolute difference (in seconds) between the timestamp
@@ -41,4 +44,19 @@ message RealityConfig {
   // time. Rejects stale/replayed ClientHellos. Mirrors REALITY's MaxTimeDiff.
   // If 0, defaults to 90 seconds. Set to a large value to effectively disable.
   uint32 max_time_diff_seconds = 4;
+
+  // Live mirror target, e.g. ``www.apple.com:443``. When set, the handshaker
+  // dials this target during the (suspended) handshake, captures its real
+  // ServerHello live, and injects that — eliminating the fingerprint drift that
+  // a static ``mirror_server_hello`` accrues as the real target changes. The
+  // dial runs asynchronously on the connection's dispatcher (the handshake is
+  // suspended via ssl_select_cert_retry, so no worker thread is blocked). If
+  // the live capture fails, the handshaker falls back to ``mirror_server_hello``
+  // when present. Host is used as the SNI presented to the target.
+  string mirror_target = 5;
+
+  // Timeout (seconds) for the live mirror dial + ServerHello capture. If 0,
+  // defaults to 5 seconds. On timeout the handshaker falls back to
+  // ``mirror_server_hello`` (or fails the connection if none is set).
+  uint32 mirror_dial_timeout_seconds = 6;
 }
