@@ -122,6 +122,8 @@ NaiveForwardProxyFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool) {
   }
 
   if (mode_ == Mode::kTcp) {
+    ENVOY_LOG(info, "NAIVE_DIAG decodeHeaders: CONNECT tcp target={}:{}", target_host_,
+              target_port_);
     // Start DNS resolution for TCP target
     startTcpDnsResolve();
   } else {
@@ -335,7 +337,11 @@ void NaiveForwardProxyFilter::startTcpConnect(Network::Address::InstanceConstSha
   tcp_upstream_->enableHalfClose(true);
   tcp_upstream_->addConnectionCallbacks(*this);
   tcp_upstream_->addReadFilter(std::make_shared<TcpReadFilter>(*this, alive_));
+  ENVOY_LOG(info, "NAIVE_DIAG startTcpConnect: connecting to {} (fast_open={})",
+            address->asString(), config_->fastOpen());
   tcp_upstream_->connect();
+  ENVOY_LOG(info, "NAIVE_DIAG startTcpConnect: connect() returned, state={}",
+            static_cast<int>(tcp_upstream_->state()));
 }
 
 void NaiveForwardProxyFilter::onEvent(Network::ConnectionEvent event) {
@@ -343,10 +349,13 @@ void NaiveForwardProxyFilter::onEvent(Network::ConnectionEvent event) {
 }
 
 void NaiveForwardProxyFilter::onTcpUpstreamEvent(Network::ConnectionEvent event) {
+  ENVOY_LOG(info, "NAIVE_DIAG onTcpUpstreamEvent: event={} state={}",
+            static_cast<int>(event), static_cast<int>(state_));
   if (event == Network::ConnectionEvent::Connected) {
     tcp_upstream_connected_ = true;
     if (!config_->fastOpen()) {
       send200OK();
+      ENVOY_LOG(info, "NAIVE_DIAG onTcpUpstreamEvent: send200OK done");
     }
     state_ = State::kTunneling;
     scheduleIdleTimeout();
@@ -367,6 +376,8 @@ void NaiveForwardProxyFilter::onTcpUpstreamEvent(Network::ConnectionEvent event)
 }
 
 void NaiveForwardProxyFilter::relayClientToTcpUpstream(Buffer::Instance& data, bool end_stream) {
+  ENVOY_LOG(info, "NAIVE_DIAG relayClientToTcpUpstream: len={} end_stream={} conn={} connected={}",
+            data.length(), end_stream, tcp_upstream_ != nullptr, tcp_upstream_connected_);
   if (!tcp_upstream_ || !tcp_upstream_connected_) {
     return;
   }
