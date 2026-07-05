@@ -283,3 +283,39 @@ diff -ruN a/ssl/tls13_server.cc b/ssl/tls13_server.cc
 +    bool (*cb)(SSL *ssl, const uint8_t **out, size_t *out_len)) {
 +  reality_serverhello_cb = cb;
 +}
+diff -ruN a/ssl/extensions.cc b/ssl/extensions.cc
+--- a/ssl/extensions.cc	2026-06-30 09:46:53.841089743 +0000
++++ b/ssl/extensions.cc	2026-06-30 09:46:53.845089762 +0000
+@@ -45,6 +45,11 @@
+ #include "../crypto/spake2plus/internal.h"
+ #include "internal.h"
+ 
++// === REALITY: global ServerHello mirror callback (defined in tls13_server.cc).
++// Non-null only on REALITY server connections; used below to allow signing the
++// CertificateVerify with Ed25519 even though the REALITY client omits it. ===
++extern bool (*reality_serverhello_cb)(SSL *ssl, const uint8_t **out,
++                                      size_t *out_len);
+ 
+ BSSL_NAMESPACE_BEGIN
+ 
+@@ -5004,6 +5009,20 @@
+     if (!ssl_pkey_supports_algorithm(ssl, cred->pubkey.get(), sigalg,
+                                      /*is_verify=*/false)) {
+       continue;
++    }
++
++    // REALITY carve-out (mirror of the client-side tls12_check_peer_sigalg
++    // change): the REALITY client deliberately omits Ed25519 from its
++    // advertised signature_algorithms so its ClientHello stays byte-identical
++    // to a real Chrome. The REALITY server nonetheless signs its
++    // CertificateVerify with Ed25519 (its disguise leaf is Ed25519). Allow
++    // selecting Ed25519 even though the peer did not advertise it, but only on
++    // REALITY connections. This does not weaken security: REALITY's trust comes
++    // from the session_id X25519+HKDF authentication, not the certificate chain.
++    if (::reality_serverhello_cb != nullptr && sigalg == SSL_SIGN_ED25519 &&
++        ssl->server) {
++      *out = sigalg;
++      return true;
+     }
+ 
+     if (std::find(peer_sigalgs.begin(), peer_sigalgs.end(), sigalg) !=
