@@ -446,16 +446,8 @@ void NaiveForwardProxyFilter::processUotData(Buffer::Instance& data) {
     if (frame->type == FrameType::kHandshake) {
       onUotHandshake(*frame);
     } else if (frame->type == FrameType::kData) {
-      ENVOY_LOG(info,
-                "naive_forward_proxy: UoT DIAG data frame len={} dest={}:{} "
-                "state_tunneling={} udp_fd={}",
-                frame->payload.size(), frame->destination.host,
-                frame->destination.port, state_ == State::kTunneling, udp_fd_);
       if (state_ == State::kTunneling) {
         relayUotFrameToUdp(*frame);
-      } else {
-        ENVOY_LOG(warn, "naive_forward_proxy: UoT DIAG DROPPED data frame "
-                        "(not tunneling yet)");
       }
     }
   }
@@ -589,7 +581,6 @@ void NaiveForwardProxyFilter::createUdpSocket(Network::Address::InstanceConstSha
 }
 
 void NaiveForwardProxyFilter::onFileEvent(uint32_t events) {
-  ENVOY_LOG(info, "naive_forward_proxy: UoT DIAG onFileEvent events={}", events);
   if (events & Event::FileReadyType::Read) {
     onUdpReadable();
   }
@@ -676,9 +667,6 @@ void NaiveForwardProxyFilter::onUdpReadable() {
 }
 
 void NaiveForwardProxyFilter::relayUotFrameToUdp(const UotFrame& frame) {
-  ENVOY_LOG(info, "naive_forward_proxy: UoT DIAG relayUotFrameToUdp fd={} "
-                  "is_connect={} len={}",
-            udp_fd_, udp_is_connect_, frame.payload.size());
   if (udp_fd_ < 0) return;
 
   auto& os_syscalls = Api::OsSysCallsSingleton::get();
@@ -713,11 +701,6 @@ void NaiveForwardProxyFilter::relayUotFrameToUdp(const UotFrame& frame) {
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
     auto send_result = os_syscalls.sendmsg(udp_fd_, &msg, 0);
-    ENVOY_LOG(info,
-              "naive_forward_proxy: UoT DIAG sendmsg fd={} to={} namelen={} "
-              "payload={} rv={} errno={}",
-              udp_fd_, address->asString(), msg.msg_namelen, payload.size(),
-              send_result.return_value_, send_result.errno_);
     if (send_result.return_value_ < 0) {
       ENVOY_LOG(warn, "naive_forward_proxy: UDP sendmsg error: {}", send_result.errno_);
     }
