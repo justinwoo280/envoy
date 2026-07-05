@@ -123,6 +123,8 @@ private:
   void startTcpConnect(Network::Address::InstanceConstSharedPtr address);
   void onTcpUpstreamEvent(Network::ConnectionEvent event);
   void relayClientToTcpUpstream(Buffer::Instance& data, bool end_stream);
+  // Flush client bytes buffered before the upstream connected (fast-open race).
+  void flushPendingToUpstream();
   void relayTcpUpstreamToClient(Buffer::Instance& data, bool end_stream);
 
   // TCP upstream read filter.
@@ -203,6 +205,10 @@ private:
   bool tcp_upstream_connected_ = false;
   bool client_half_closed_ = false;
   bool upstream_half_closed_ = false;
+  // Plaintext (padding already stripped) received from the client before the
+  // upstream finished connecting; flushed by flushPendingToUpstream() on the
+  // Connected event. Prevents losing the first payload in fast-open mode.
+  Buffer::OwnedImpl pending_upstream_data_;
 
   // UDP upstream (syscalls via Api::OsSysCallsSingleton::get() at each use site)
   int udp_fd_ = -1;

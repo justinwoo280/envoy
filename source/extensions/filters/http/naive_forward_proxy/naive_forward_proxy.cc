@@ -122,8 +122,6 @@ NaiveForwardProxyFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool) {
   }
 
   if (mode_ == Mode::kTcp) {
-    ENVOY_LOG(info, "NAIVE_DIAG decodeHeaders: CONNECT tcp target={}:{}", target_host_,
-              target_port_);
     // Start DNS resolution for TCP target
     startTcpDnsResolve();
   } else {
@@ -149,9 +147,13 @@ Http::FilterDataStatus NaiveForwardProxyFilter::decodeData(Buffer::Instance& dat
 
   if (end_stream) {
     client_half_closed_ = true;
-    if (mode_ == Mode::kTcp && tcp_upstream_) {
-      // Half-close the upstream by writing end_stream (half-close was enabled
-      // via enableHalfClose(true) on connect).
+    // Half-close the upstream by writing end_stream (half-close was enabled via
+    // enableHalfClose(true) on connect). Only do this once the upstream is
+    // connected; if it is still connecting, the buffered bytes (and this
+    // half-close) are flushed by flushPendingToUpstream() on the Connected
+    // event, which honors client_half_closed_. Writing here while connecting
+    // would double the end_stream signal.
+    if (mode_ == Mode::kTcp && tcp_upstream_ && tcp_upstream_connected_) {
       Buffer::OwnedImpl empty;
       tcp_upstream_->write(empty, true);
     }
@@ -337,11 +339,7 @@ void NaiveForwardProxyFilter::startTcpConnect(Network::Address::InstanceConstSha
   tcp_upstream_->enableHalfClose(true);
   tcp_upstream_->addConnectionCallbacks(*this);
   tcp_upstream_->addReadFilter(std::make_shared<TcpReadFilter>(*this, alive_));
-  ENVOY_LOG(info, "NAIVE_DIAG startTcpConnect: connecting to {} (fast_open={})",
-            address->asString(), config_->fastOpen());
   tcp_upstream_->connect();
-  ENVOY_LOG(info, "NAIVE_DIAG startTcpConnect: connect() returned, state={}",
-            static_cast<int>(tcp_upstream_->state()));
 }
 
 void NaiveForwardProxyFilter::onEvent(Network::ConnectionEvent event) {
@@ -349,15 +347,20 @@ void NaiveForwardProxyFilter::onEvent(Network::ConnectionEvent event) {
 }
 
 void NaiveForwardProxyFilter::onTcpUpstreamEvent(Network::ConnectionEvent event) {
-  ENVOY_LOG(info, "NAIVE_DIAG onTcpUpstreamEvent: event={} state={}",
-            static_cast<int>(event), static_cast<int>(state_));
   if (event == Network::ConnectionEvent::Connected) {
     tcp_upstream_connected_ = true;
     if (!config_->fastOpen()) {
       send200OK();
-      ENVOY_LOG(info, "NAIVE_DIAG onTcpUpstreamEvent: send200OK done");
     }
     state_ = State::kTunneling;
+    // Flush any client bytes that arrived before the upstream finished
+    // connecting. With fast-open the 200 OK is sent from decodeHeaders, so the
+    // client may push the first payload (e.g. a TLS ClientHello) while the
+    // upstream connect is still in flight; those bytes are buffered in
+    // pending_upstream_data_ by relayClientToTcpUpstream() and must be written
+    // now, otherwise the target never receives the handshake and the stream
+    // stalls until a timeout.
+    flushPendingToUpstream();
     scheduleIdleTimeout();
   } else if (event == Network::ConnectionEvent::RemoteClose ||
              event == Network::ConnectionEvent::LocalClose) {
@@ -376,23 +379,46 @@ void NaiveForwardProxyFilter::onTcpUpstreamEvent(Network::ConnectionEvent event)
 }
 
 void NaiveForwardProxyFilter::relayClientToTcpUpstream(Buffer::Instance& data, bool end_stream) {
-  ENVOY_LOG(info, "NAIVE_DIAG relayClientToTcpUpstream: len={} end_stream={} conn={} connected={}",
-            data.length(), end_stream, tcp_upstream_ != nullptr, tcp_upstream_connected_);
-  if (!tcp_upstream_ || !tcp_upstream_connected_) {
+  // The upstream connection was already torn down (or never created): nothing
+  // to relay to.
+  if (!tcp_upstream_) {
     return;
   }
 
-  // Strip padding if enabled
+  // Strip padding (streaming/stateful) into a local plaintext buffer. This must
+  // run for every chunk even before the upstream is connected, otherwise the
+  // padding decoder would desync when we later replay the buffered bytes.
+  Buffer::OwnedImpl plaintext;
   if (padding_enabled_ && padding_decoder_.decodePaddingActive()) {
     std::string payload;
     auto* bytes = reinterpret_cast<const uint8_t*>(data.linearize(data.length()));
     padding_decoder_.decode(bytes, data.length(), &payload);
-    Buffer::OwnedImpl buf;
-    buf.add(payload.data(), payload.size());
-    tcp_upstream_->write(buf, end_stream && client_half_closed_);
+    plaintext.add(payload.data(), payload.size());
   } else {
-    // Pass-through
-    tcp_upstream_->write(data, end_stream && client_half_closed_);
+    plaintext.move(data);
+  }
+
+  if (!tcp_upstream_connected_) {
+    // Upstream connect still in flight (can happen in fast-open mode where the
+    // 200 OK is sent from decodeHeaders). Buffer the plaintext; it is flushed by
+    // flushPendingToUpstream() once the Connected event fires. Dropping it here
+    // would lose the client's first payload and stall the stream.
+    pending_upstream_data_.move(plaintext);
+    return;
+  }
+
+  tcp_upstream_->write(plaintext, end_stream && client_half_closed_);
+}
+
+void NaiveForwardProxyFilter::flushPendingToUpstream() {
+  if (!tcp_upstream_ || !tcp_upstream_connected_) {
+    return;
+  }
+  // Write buffered pre-connect bytes, honoring a client half-close that may have
+  // been recorded while the upstream was still connecting.
+  const bool half_close = client_half_closed_;
+  if (pending_upstream_data_.length() > 0 || half_close) {
+    tcp_upstream_->write(pending_upstream_data_, half_close);
   }
 }
 
