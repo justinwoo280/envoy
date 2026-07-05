@@ -21,14 +21,18 @@ Status snapshot of what is done, what is untested, and what remains. See
       Windows), auto-variant only. Linux tested end-to-end.
 - [x] Docs: `DESIGN.md`, `NAIVE_SERVER_CONFIG.md`, `NAIVE_BUILD_RUNBOOK.md`,
       `NAIVE_TRIM.md`, naiveproxy `tun/README.md`.
+- [x] Windows x64 client build (CI `build-win` job). All changes — including
+      bind-interface's `IP_UNICAST_IF` path — compile and link; artifact is a
+      valid PE32+ `naive.exe` importing IPHLPAPI.DLL and WS2_32.dll.
 
 ## Untested / needs a real environment
 
 - [ ] macOS and Windows TUN hook scripts: logic is aligned with the tested Linux
       variant but **not run on real macOS/Windows**. Verify on hardware.
-- [ ] `bind-interface: "auto"` probe on macOS (`IP_BOUND_IF`) and Windows
-      (`IP_UNICAST_IF`) against a real physical NIC (only Linux `SO_BINDTODEVICE`
-      exercised so far).
+- [ ] `bind-interface: "auto"` runtime probe on macOS (`IP_BOUND_IF`) and Windows
+      (`IP_UNICAST_IF`) against a real physical NIC (compiles on Windows; only
+      Linux `SO_BINDTODEVICE` exercised at runtime so far).
+- [ ] macOS client build (CI job not yet added; upstream build.yml has mac jobs).
 - [ ] musl-static client build (optional release variant).
 
 ## Cleanup / hygiene
