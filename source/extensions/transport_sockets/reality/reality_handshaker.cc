@@ -251,8 +251,21 @@ bool RealityHandshaker::extractAndVerifyAuth(const SSL_CLIENT_HELLO* client_hell
   constexpr size_t kMlkem768PublicKeyBytes = 1184;
   constexpr size_t kHybridKeyShareLen = kMlkem768PublicKeyBytes + 32;
 
+  // Two distinct concerns, tracked separately:
+  //  * peer_pub: the client's X25519 public value used for the REALITY ECDH
+  //    auth. Either a plain X25519 share or the X25519 half of the hybrid works,
+  //    so we may prefer whichever is easiest to extract.
+  //  * negotiated_group_: the group BoringSSL will actually negotiate for the
+  //    real client-facing handshake. TLS 1.3 servers honor the *client's*
+  //    key_share preference order, so this is the FIRST offered key_share group
+  //    (that we support). The live mirror MUST be dialed with this exact group,
+  //    otherwise the captured ServerHello's key_share is a different size/type
+  //    than the one BoringSSL needs to emit, and the injected ServerHello is
+  //    rejected. (This is why a client offering X25519MLKEM768 first must not
+  //    dial the mirror as plain X25519.)
   std::vector<uint8_t> peer_pub;        // chosen X25519 public key (32 bytes)
   std::vector<uint8_t> hybrid_x25519;   // fallback from X25519MLKEM768
+  bool group_chosen = false;            // first supported group -> negotiated_group_
   while (CBS_len(&shares) > 0) {
     uint16_t group, key_len;
     CBS key_data;
@@ -262,16 +275,23 @@ bool RealityHandshaker::extractAndVerifyAuth(const SSL_CLIENT_HELLO* client_hell
     (void)key_len;
     if (group == SSL_CURVE_X25519 && CBS_len(&key_data) == 32) {
       peer_pub.assign(CBS_data(&key_data), CBS_data(&key_data) + 32);
-      negotiated_group_ = SSL_CURVE_X25519;
-      break; // plain X25519 preferred; stop searching
+      if (!group_chosen) {
+        negotiated_group_ = SSL_CURVE_X25519;
+        group_chosen = true;
+      }
+      // Do NOT break: a plain X25519 share may follow a preferred hybrid share;
+      // we still need to know which group came first for the mirror dial.
     }
-    if (group == kGroupX25519Mlkem768 && CBS_len(&key_data) == kHybridKeyShareLen &&
-        hybrid_x25519.empty()) {
-      // X25519 public value is the trailing 32 bytes.
-      const uint8_t* x = CBS_data(&key_data) + kMlkem768PublicKeyBytes;
-      hybrid_x25519.assign(x, x + 32);
-      negotiated_group_ = kGroupX25519Mlkem768;
-      // keep scanning in case a plain X25519 share also appears
+    if (group == kGroupX25519Mlkem768 && CBS_len(&key_data) == kHybridKeyShareLen) {
+      if (hybrid_x25519.empty()) {
+        // X25519 public value is the trailing 32 bytes.
+        const uint8_t* x = CBS_data(&key_data) + kMlkem768PublicKeyBytes;
+        hybrid_x25519.assign(x, x + 32);
+      }
+      if (!group_chosen) {
+        negotiated_group_ = kGroupX25519Mlkem768;
+        group_chosen = true;
+      }
     }
   }
   if (peer_pub.empty() && !hybrid_x25519.empty()) {
