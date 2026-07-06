@@ -1,10 +1,9 @@
 #include "source/extensions/transport_sockets/reality/mirror_dialer.h"
 
-#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <unistd.h>
 
+#include "absl/status/status.h"
 #include "envoy/network/address.h"
 
 #include "source/common/api/os_sys_calls_impl.h"
@@ -39,7 +38,7 @@ MirrorDialer::~MirrorDialer() {
     file_event_.reset();
   }
   if (fd_ >= 0) {
-    ::close(fd_);
+    Api::OsSysCallsSingleton::get().close(fd_);
     fd_ = -1;
   }
 }
@@ -79,19 +78,20 @@ void MirrorDialer::onResolve(Network::DnsResolver::ResolutionStatus status,
 void MirrorDialer::connectTo(const Network::Address::InstanceConstSharedPtr& address) {
   const sockaddr* sa = address->sockAddr();
   const socklen_t sa_len = address->sockAddrLen();
-  fd_ = ::socket(sa->sa_family, SOCK_STREAM, 0);
-  if (fd_ < 0) {
-    ENVOY_LOG(debug, "REALITY mirror dial: socket() failed");
+  auto& os = Api::OsSysCallsSingleton::get();
+
+  // Non-blocking TCP socket (SOCK_NONBLOCK avoids a separate fcntl).
+  auto sock_result = os.socket(sa->sa_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  if (sock_result.return_value_ < 0) {
+    ENVOY_LOG(debug, "REALITY mirror dial: socket() failed errno={}", sock_result.errno_);
     finish({});
     return;
   }
-  // Non-blocking.
-  int flags = ::fcntl(fd_, F_GETFL, 0);
-  ::fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
+  fd_ = sock_result.return_value_;
 
-  int rc = ::connect(fd_, sa, sa_len);
-  if (rc != 0 && errno != EINPROGRESS) {
-    ENVOY_LOG(debug, "REALITY mirror dial: connect() failed errno={}", errno);
+  auto conn_result = os.connect(fd_, sa, sa_len);
+  if (conn_result.return_value_ != 0 && conn_result.errno_ != EINPROGRESS) {
+    ENVOY_LOG(debug, "REALITY mirror dial: connect() failed errno={}", conn_result.errno_);
     finish({});
     return;
   }
@@ -123,7 +123,12 @@ void MirrorDialer::connectTo(const Network::Address::InstanceConstSharedPtr& add
   SSL_set0_wbio(ssl_.get(), wbio_.get());
 
   file_event_ = dispatcher_.createFileEvent(
-      fd_, [this](uint32_t events) { onSocketEvent(events); }, Event::FileTriggerType::Edge,
+      fd_,
+      [this](uint32_t events) {
+        onSocketEvent(events);
+        return absl::OkStatus();
+      },
+      Event::FileTriggerType::Edge,
       Event::FileReadyType::Read | Event::FileReadyType::Write);
 }
 
@@ -246,7 +251,7 @@ void MirrorDialer::finish(std::vector<uint8_t>&& server_hello) {
     dns_query_ = nullptr;
   }
   if (fd_ >= 0) {
-    ::close(fd_);
+    Api::OsSysCallsSingleton::get().close(fd_);
     fd_ = -1;
   }
   // Invoke the completion callback last; it may delete us.
