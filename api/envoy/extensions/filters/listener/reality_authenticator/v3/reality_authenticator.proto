@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.listener.reality_authenticator.v3;
+
+import "validate/validate.proto";
+
+import "udpa/annotations/status.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.filters.listener.reality_authenticator.v3";
+option java_outer_classname = "RealityAuthenticatorProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/reality_authenticator/v3;reality_authenticatorv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// [#protodoc-title: REALITY Authenticator Listener Filter]
+// Peeks the TLS ClientHello at L4 and runs the REALITY session-id
+// authentication (X25519/HKDF/AES-GCM). It never terminates TLS; it only writes
+// the boolean verdict into dynamic metadata under key
+// ``envoy.filters.listener.reality_authenticator`` (field ``authenticated``), so
+// a ``filter_chain_matcher`` can route authenticated connections to the REALITY
+// TLS filter chain and unauthenticated ones (probers/browsers) to a transparent
+// fallback (tcp_proxy to the real dest). The original ClientHello bytes are
+// peeked with MSG_PEEK and never consumed, so both downstream chains re-read the
+// full ClientHello.
+// [#extension: envoy.filters.listener.reality_authenticator]
+message RealityAuthenticator {
+  // X25519 server private key (raw 32 bytes), base64-encoded. Same value as the
+  // REALITY transport socket's ``private_key``.
+  string private_key = 1 [(validate.rules).string = {min_len: 1}];
+
+  // REALITY short id (base64-encoded, decodes to <=8 bytes). Same value as the
+  // REALITY transport socket's ``short_id``.
+  string short_id = 2 [(validate.rules).string = {min_len: 1}];
+
+  // Anti-replay window: reject if the auth token's embedded timestamp differs
+  // from now by more than this many seconds. Defaults to 90 if unset (0).
+  uint32 max_time_diff_seconds = 3;
+}

@@ -1,5 +1,7 @@
 #include "source/extensions/transport_sockets/reality/reality_handshaker.h"
 
+#include "source/extensions/transport_sockets/reality/reality_auth.h"
+
 #include <cstring>
 
 #include <openssl/aes.h>
@@ -11,6 +13,7 @@
 #include <openssl/ssl.h>
 
 #include "absl/container/inlined_vector.h"
+#include "absl/types/span.h"
 #include "openssl/bytestring.h"
 
 namespace Envoy {
@@ -217,192 +220,19 @@ void RealityHandshaker::onMirrorDialComplete(std::vector<uint8_t>&& server_hello
 // extractAndVerifyAuth — X25519 + HKDF + AES-GCM, compatible with REALITY Go
 // ---------------------------------------------------------------------------
 bool RealityHandshaker::extractAndVerifyAuth(const SSL_CLIENT_HELLO* client_hello) {
-  // 1. Find X25519 key share in ClientHello extensions
-  const uint8_t* ks_ext = nullptr;
-  size_t ks_ext_len = 0;
-  if (!SSL_early_callback_ctx_extension_get(client_hello, TLSEXT_TYPE_key_share, &ks_ext,
-                                             &ks_ext_len)) {
+  // Delegate to the shared, session-less auth function (single source of truth,
+  // also used by the L4 fallback listener filter). Copy the derived values this
+  // handshaker needs (HKDF key, client session_id to echo, negotiated group for
+  // the mirror dial) out of the result.
+  RealityAuthResult result;
+  if (!realityVerifyAuth(client_hello, absl::MakeConstSpan(config_->privateKey()),
+                         absl::MakeConstSpan(config_->shortId()), config_->maxTimeDiffSeconds(),
+                         &result)) {
     return false;
   }
-
-  // Parse key_share extension: client_shares_len(2) + [group(2) + key_len(2) + key(key_len)]...
-  CBS cbs;
-  CBS_init(&cbs, ks_ext, ks_ext_len);
-  CBS shares;
-  if (!CBS_get_u16_length_prefixed(&cbs, &shares)) {
-    return false;
-  }
-
-  // REALITY authenticates using the client's X25519 public value. The client
-  // may offer it either as a plain X25519 key share (32 bytes) or as the
-  // X25519 component of the post-quantum hybrid X25519MLKEM768 key share, whose
-  // wire layout is [ MLKEM768_public_key (1184) ][ X25519_public_key (32) ].
-  // This matches the client-side patch and REALITY's own behavior of using
-  // keyShare.data[EncapsulationKeySize768:] for the hybrid group. We collect
-  // both candidates in one pass and prefer plain X25519 if present.
-  //
-  // Constants (from BoringSSL): SSL_GROUP_X25519_MLKEM768 = 0x11ec,
-  // MLKEM768_PUBLIC_KEY_BYTES = 1184. Named constants are used if available.
-#ifndef SSL_GROUP_X25519_MLKEM768
-  constexpr uint16_t kGroupX25519Mlkem768 = 0x11ec;
-#else
-  constexpr uint16_t kGroupX25519Mlkem768 = SSL_GROUP_X25519_MLKEM768;
-#endif
-  constexpr size_t kMlkem768PublicKeyBytes = 1184;
-  constexpr size_t kHybridKeyShareLen = kMlkem768PublicKeyBytes + 32;
-
-  // Two distinct concerns, tracked separately:
-  //  * peer_pub: the client's X25519 public value used for the REALITY ECDH
-  //    auth. Either a plain X25519 share or the X25519 half of the hybrid works,
-  //    so we may prefer whichever is easiest to extract.
-  //  * negotiated_group_: the group BoringSSL will actually negotiate for the
-  //    real client-facing handshake. TLS 1.3 servers honor the *client's*
-  //    key_share preference order, so this is the FIRST offered key_share group
-  //    (that we support). The live mirror MUST be dialed with this exact group,
-  //    otherwise the captured ServerHello's key_share is a different size/type
-  //    than the one BoringSSL needs to emit, and the injected ServerHello is
-  //    rejected. (This is why a client offering X25519MLKEM768 first must not
-  //    dial the mirror as plain X25519.)
-  std::vector<uint8_t> peer_pub;        // chosen X25519 public key (32 bytes)
-  std::vector<uint8_t> hybrid_x25519;   // fallback from X25519MLKEM768
-  bool group_chosen = false;            // first supported group -> negotiated_group_
-  while (CBS_len(&shares) > 0) {
-    uint16_t group, key_len;
-    CBS key_data;
-    if (!CBS_get_u16(&shares, &group) || !CBS_get_u16_length_prefixed(&shares, &key_data)) {
-      return false;
-    }
-    (void)key_len;
-    if (group == SSL_CURVE_X25519 && CBS_len(&key_data) == 32) {
-      peer_pub.assign(CBS_data(&key_data), CBS_data(&key_data) + 32);
-      if (!group_chosen) {
-        negotiated_group_ = SSL_CURVE_X25519;
-        group_chosen = true;
-      }
-      // Do NOT break: a plain X25519 share may follow a preferred hybrid share;
-      // we still need to know which group came first for the mirror dial.
-    }
-    if (group == kGroupX25519Mlkem768 && CBS_len(&key_data) == kHybridKeyShareLen) {
-      if (hybrid_x25519.empty()) {
-        // X25519 public value is the trailing 32 bytes.
-        const uint8_t* x = CBS_data(&key_data) + kMlkem768PublicKeyBytes;
-        hybrid_x25519.assign(x, x + 32);
-      }
-      if (!group_chosen) {
-        negotiated_group_ = kGroupX25519Mlkem768;
-        group_chosen = true;
-      }
-    }
-  }
-  if (peer_pub.empty() && !hybrid_x25519.empty()) {
-    peer_pub = std::move(hybrid_x25519);
-  }
-  if (peer_pub.empty()) {
-    return false;
-  }
-
-  // 2. X25519 ECDH: AuthKey = X25519(server_priv, client_pub)
-  std::vector<uint8_t> shared_secret(32);
-  if (X25519(shared_secret.data(), config_->privateKey().data(), peer_pub.data()) != 1) {
-    return false;
-  }
-
-  // 3. HKDF-SHA256: key = HKDF(ikm=shared_secret, salt=random[:20], info="REALITY")
-  const uint8_t* random = client_hello->random;
-  uint8_t salt[20];
-  memcpy(salt, random, 20);
-  static const uint8_t kInfo[] = {'R', 'E', 'A', 'L', 'I', 'T', 'Y'};
-  auth_key_.resize(32);
-  if (HKDF(auth_key_.data(), 32, EVP_sha256(), shared_secret.data(), 32, salt, 20, kInfo,
-           sizeof(kInfo)) != 1) {
-    return false;
-  }
-
-  // 4. AES-256-GCM decrypt: nonce=random[20:32], aad=full ClientHello (with header)
-  //    ciphertext = session_id (32 bytes = 16 plaintext + 16 tag)
-  if (client_hello->session_id_len != 32) {
-    return false;
-  }
-  // Remember the client's legacy_session_id so the mirrored ServerHello can
-  // echo it (TLS 1.3 requires legacy_session_id_echo == ClientHello's, and the
-  // captured mirror carries the ORIGINAL target's session_id, which would
-  // otherwise break the client's handshake with a bad record MAC).
-  client_session_id_.assign(client_hello->session_id,
-                            client_hello->session_id + client_hello->session_id_len);
-
-  // AAD = handshake header (type=0x01 + 3-byte length) + client_hello body
-  std::vector<uint8_t> aad;
-  aad.reserve(4 + client_hello->client_hello_len);
-  aad.push_back(0x01); // ClientHello
-  uint32_t ch_len = static_cast<uint32_t>(client_hello->client_hello_len);
-  aad.push_back((ch_len >> 16) & 0xff);
-  aad.push_back((ch_len >> 8) & 0xff);
-  aad.push_back(ch_len & 0xff);
-  aad.insert(aad.end(), client_hello->client_hello, client_hello->client_hello + client_hello->client_hello_len);
-
-  // CRITICAL: the client computes the AEAD AAD over the ClientHello with the
-  // session_id field (bytes [39:71] of the handshake message: 4-byte header +
-  // 2-byte legacy_version + 32-byte random + 1-byte session_id_len brings us to
-  // offset 39) ZEROED. We must zero the same bytes here or the GCM tag will
-  // never verify. Without this, every REALITY handshake fails authentication.
-  if (aad.size() >= 39 + 32) {
-    memset(aad.data() + 39, 0, 32);
-  } else {
-    return false;
-  }
-
-  std::vector<uint8_t> plaintext(16); // 32 - 16 (tag) = 16
-  // Use EVP for AES-256-GCM
-  bssl::UniquePtr<EVP_CIPHER_CTX> ectx(EVP_CIPHER_CTX_new());
-  if (!EVP_DecryptInit_ex(ectx.get(), EVP_aes_256_gcm(), nullptr, nullptr, nullptr)) {
-    return false;
-  }
-  EVP_CIPHER_CTX_ctrl(ectx.get(), EVP_CTRL_GCM_SET_IVLEN, 12, nullptr);
-  EVP_DecryptInit_ex(ectx.get(), nullptr, nullptr, auth_key_.data(), random + 20);
-  int len;
-  EVP_DecryptUpdate(ectx.get(), nullptr, &len, aad.data(), aad.size());
-  EVP_DecryptUpdate(ectx.get(), plaintext.data(), &len, client_hello->session_id, 16);
-  if (EVP_CIPHER_CTX_ctrl(ectx.get(), EVP_CTRL_GCM_SET_TAG, 16,
-                           const_cast<uint8_t*>(client_hello->session_id + 16)) != 1) {
-    return false;
-  }
-  int flen;
-  if (EVP_DecryptFinal_ex(ectx.get(), nullptr, &flen) != 1) {
-    return false; // GCM tag verification failed
-  }
-
-  // 5. Verify plaintext: ver[0:3] + reserved[3] + time[4:8 BE] + shortId[8:16].
-  if (plaintext.size() < 16) {
-    return false;
-  }
-
-  // 5a. Anti-replay: reject if the embedded timestamp is too far from now.
-  //     Mirrors REALITY's MaxTimeDiff check.
-  const uint8_t* t = plaintext.data() + 4;
-  const uint64_t client_time = (static_cast<uint64_t>(t[0]) << 24) |
-                               (static_cast<uint64_t>(t[1]) << 16) |
-                               (static_cast<uint64_t>(t[2]) << 8) |
-                               static_cast<uint64_t>(t[3]);
-  const uint64_t now = static_cast<uint64_t>(::time(nullptr));
-  const uint64_t diff = now > client_time ? now - client_time : client_time - now;
-  if (diff > config_->maxTimeDiffSeconds()) {
-    ENVOY_LOG(debug, "REALITY timestamp out of range: diff={}s max={}s", diff,
-              config_->maxTimeDiffSeconds());
-    return false;
-  }
-
-  // 5b. Short ID must match exactly. The config layer already guarantees a
-  //     non-empty, <=8-byte short_id (no "accept any" bypass).
-  const uint8_t* recv_short_id = plaintext.data() + 8;
-  const auto& cfg_short_id = config_->shortId();
-  if (cfg_short_id.empty() || cfg_short_id.size() > 8) {
-    return false;
-  }
-  if (CRYPTO_memcmp(recv_short_id, cfg_short_id.data(), cfg_short_id.size()) != 0) {
-    ENVOY_LOG(debug, "REALITY short_id mismatch");
-    return false;
-  }
-
+  auth_key_ = std::move(result.auth_key);
+  client_session_id_ = std::move(result.client_session_id);
+  negotiated_group_ = result.negotiated_group;
   ENVOY_LOG(debug, "REALITY auth verified");
   return true;
 }

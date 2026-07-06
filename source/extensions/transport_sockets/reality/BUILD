@@ -1,12 +1,27 @@
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_extension",
+    "envoy_cc_library",
     "envoy_extension_package",
 )
 
 licenses(["notice"])  # Apache 2
 
 envoy_extension_package()
+
+# Shared, session-less REALITY auth check (X25519/HKDF/AES-GCM). Reused by the
+# transport socket handshaker and the L4 reality_authenticator listener filter,
+# so it lives in its own library to avoid a dependency cycle / duplicate symbols.
+envoy_cc_library(
+    name = "reality_auth_lib",
+    srcs = ["reality_auth.cc"],
+    hdrs = ["reality_auth.h"],
+    external_deps = ["ssl"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//source/common/common:assert_lib",
+    ],
+)
 
 envoy_cc_extension(
     name = "reality",
@@ -22,6 +37,7 @@ envoy_cc_extension(
         "reality_handshaker.h",
     ],
     deps = [
+        ":reality_auth_lib",
         "//envoy/api:api_interface",
         "//envoy/event:dispatcher_interface",
         "//envoy/network:dns_interface",

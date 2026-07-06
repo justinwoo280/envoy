@@ -870,6 +870,13 @@ envoy.filters.listener.tls_inspector:
   status: stable
   type_urls:
   - envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+envoy.filters.listener.reality_authenticator:
+  categories:
+  - envoy.filters.listener
+  security_posture: robust_to_untrusted_downstream_and_upstream
+  status: alpha
+  type_urls:
+  - envoy.extensions.filters.listener.reality_authenticator.v3.RealityAuthenticator
 envoy.filters.listener.dynamic_modules:
   categories:
   - envoy.filters.listener
