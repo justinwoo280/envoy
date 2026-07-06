@@ -8,6 +8,7 @@
 
 #include "source/common/common/assert.h"
 #include "source/common/protobuf/protobuf.h"
+#include "source/common/router/string_accessor_impl.h"
 #include "source/extensions/transport_sockets/reality/reality_auth.h"
 
 #include "absl/strings/escaping.h"
@@ -21,6 +22,7 @@ namespace RealityAuthenticator {
 
 const char kMetadataNamespace[] = "envoy.filters.listener.reality_authenticator";
 const char kAuthenticatedField[] = "authenticated";
+const char kFilterStateKey[] = "envoy.filters.listener.reality_authenticator.authenticated";
 
 namespace {
 // Per-SSL slot to reach the Filter from the select_certificate_cb.
@@ -82,10 +84,19 @@ Network::FilterStatus Filter::onAccept(Network::ListenerFilterCallbacks& cb) {
 }
 
 void Filter::setAuthenticated(bool authenticated) {
+  // Write the verdict as a string FilterState object so a filter_chain_matcher
+  // using FilterStateInput (which reads serializeAsString()) + exact_match_map
+  // can route on "true"/"false". Dynamic metadata (bool) is also written for
+  // observability/logging.
+  cb_->filterState().setData(
+      kFilterStateKey, std::make_shared<Router::StringAccessorImpl>(authenticated ? "true" : "false"),
+      StreamInfo::FilterState::StateType::ReadOnly, StreamInfo::FilterState::LifeSpan::Connection);
+
   Protobuf::Struct metadata;
   auto& fields = *metadata.mutable_fields();
   fields[kAuthenticatedField].set_bool_value(authenticated);
   cb_->setDynamicMetadata(kMetadataNamespace, metadata);
+
   verdict_written_ = true;
   ENVOY_LOG(debug, "reality_authenticator: authenticated={}", authenticated);
 }

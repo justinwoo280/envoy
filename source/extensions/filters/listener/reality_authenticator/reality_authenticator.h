@@ -19,6 +19,9 @@ namespace RealityAuthenticator {
 // Dynamic metadata this filter writes: namespace key + boolean field.
 extern const char kMetadataNamespace[];
 extern const char kAuthenticatedField[];
+// FilterState key holding the verdict as a string ("true"/"false"), consumed by
+// a filter_chain_matcher via FilterStateInput.
+extern const char kFilterStateKey[];
 
 // Shared config: parsed key material + a buffer-only SSL_CTX to parse the
 // ClientHello from raw peeked bytes (same technique as tls_inspector).
