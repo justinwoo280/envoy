@@ -1,5 +1,25 @@
 # REALITY fallback (anti-active-probing) — design
 
+> **Status: IMPLEMENTED & VERIFIED (commit b03350cb).** The
+> `envoy.filters.listener.reality_authenticator` listener filter + FilterState
+> routing + tcp_proxy fallback are built into envoy-min and validated
+> end-to-end in the two-container harness:
+>
+> - **Prober path (no token):** `authenticated=false` → fallback chain →
+>   tcp_proxy to the real dest. A plain `openssl s_client` / `curl` to the
+>   REALITY port receives the **real apple EV certificate** (`CN=www.apple.com,
+>   O=Apple Inc.`, `Verify return code: 0`) and a **200** with the real 250 KB
+>   homepage — indistinguishable from visiting apple directly. (Before this: a
+>   `sslv3 alert handshake failure` — an observable anomaly.)
+> - **Authenticated path (naive):** `authenticated=true` → reality chain →
+>   `REALITY auth verified` → `live mirror captured: 1210 bytes` → **301**.
+> - **Mixed load:** 40 prober (all 200) + 40 naive (all 301) concurrent, 0
+>   crashes, 0 completion errors, envoy healthy after.
+>
+> The two halves of REALITY anti-probing are now complete: authenticated
+> connections tunnel; everyone else transparently sees the real site.
+
+
 ## Problem
 
 REALITY's whole point is to be indistinguishable from a real HTTPS site under
