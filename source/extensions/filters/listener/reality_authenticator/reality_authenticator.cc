@@ -89,8 +89,9 @@ void Filter::setAuthenticated(bool authenticated) {
   // can route on "true"/"false". Dynamic metadata (bool) is also written for
   // observability/logging.
   cb_->filterState().setData(
-      kFilterStateKey, std::make_shared<Router::StringAccessorImpl>(authenticated ? "true" : "false"),
-      StreamInfo::FilterState::StateType::ReadOnly, StreamInfo::FilterState::LifeSpan::Connection);
+      kFilterStateKey,
+      std::make_shared<Router::StringAccessorImpl>(authenticated ? "true" : "false"),
+      StreamInfo::FilterState::LifeSpan::Connection);
 
   Protobuf::Struct metadata;
   auto& fields = *metadata.mutable_fields();

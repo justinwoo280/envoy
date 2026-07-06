@@ -30,6 +30,8 @@ envoy_cc_library(
         "//source/common/protobuf",
         "//source/common/router:string_accessor_lib",
         "//source/extensions/transport_sockets/reality:reality_auth_lib",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/types:span",
         "@envoy_api//envoy/extensions/filters/listener/reality_authenticator/v3:pkg_cc_proto",
     ],
 )
