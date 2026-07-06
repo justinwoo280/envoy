@@ -189,6 +189,16 @@ read it back — an optimization, not required for correctness.
 
    Verdict: serial (A) is sufficient for a near-CDN dest; speculative (B) is a
    documented optional upgrade for far/high-precision-probe scenarios.
+
+   **Framing (important):** this extra RTT is not a *new* weakness introduced by
+   the fallback design. REALITY inherently has a timing signature — the server
+   must reach the dest (live) before it can produce a matching ServerHello, so a
+   dest that is far from the server is already observable. This is precisely why
+   the official REALITY tooling (RealiTLScanner) exists: to *find a neighbor*
+   (dest) that is close to the server. Our fallback's extra dial is the same
+   class of timing cost, mitigated by the same, already-blessed technique
+   (choose a network-close dest). It does not change REALITY's threat model; it
+   inherits it.
 2. **SNI gating.** xtls also rejects (falls back) when SNI isn't in the allowed
    set. The L4 filter should apply the same gate: SNI not matching → fallback,
    before even attempting auth.
