@@ -11,12 +11,27 @@ set -euxo pipefail
 
 COMPILE_MODE="${COMPILE_MODE:-opt}"
 
+# Size bazel to the host. GitHub Actions runners are 4c/16g; CircleCI machine
+# xlarge is 8c/32g. Rather than hardcode, detect cores + RAM so the same script
+# is fast everywhere without link-time OOM.
+#   jobs = min(nproc, floor(RAM_MB / 3500))  -- ~3.5 GB/link-job headroom
+#   ram  = RAM_MB - 4000                     -- leave 4 GB for the OS/toolchain
+# NAIVE_BAZEL_JOBS / NAIVE_BAZEL_RAM override the detection if set (both are in
+# the docker-compose env allowlist path via NUM_CPUS, or can be exported).
+CORES="${NUM_CPUS:-$(nproc)}"
+RAM_MB="$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)"
+RAM_JOB_CAP=$(( RAM_MB / 3500 ))
+JOBS="${NAIVE_BAZEL_JOBS:-$(( CORES < RAM_JOB_CAP ? CORES : RAM_JOB_CAP ))}"
+[ "${JOBS}" -lt 1 ] && JOBS=1
+LOCAL_RAM="${NAIVE_BAZEL_RAM:-$(( RAM_MB > 5000 ? RAM_MB - 4000 : RAM_MB ))}"
+echo "naive build sizing: cores=${CORES} ram_mb=${RAM_MB} -> jobs=${JOBS} local_ram=${LOCAL_RAM}"
+
 bazel build \
   --config=clang \
   --disk_cache=/build/bazel-disk \
   --repository_cache=/build/bazel-repo \
-  --jobs=4 \
-  --local_ram_resources=13000 \
+  --jobs="${JOBS}" \
+  --local_ram_resources="${LOCAL_RAM}" \
   --define=wasm=disabled \
   --define=hot_restart=disabled \
   --define=admin_html=disabled \

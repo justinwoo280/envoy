@@ -32,6 +32,10 @@ EXTENSIONS = {
     #
     "envoy.filters.listener.tls_inspector": "//source/extensions/filters/listener/tls_inspector:config",
     "envoy.filters.listener.http_inspector": "//source/extensions/filters/listener/http_inspector:config",
+    # REALITY L4 authenticator: peeks ClientHello, runs REALITY auth, writes the
+    # verdict to filter state so filter_chain_matcher can route probers to the
+    # transparent fallback (anti-active-probing).
+    "envoy.filters.listener.reality_authenticator": "//source/extensions/filters/listener/reality_authenticator:config",
 
     #
     # Transport sockets / TLS

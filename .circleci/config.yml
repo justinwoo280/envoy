@@ -1,0 +1,63 @@
+version: 2.1
+
+# Build the minimal NaiveProxy-REALITY Envoy server on CircleCI.
+#
+# Why CircleCI in addition to the GitHub Actions workflow: the machine executor
+# xlarge class is 8 vCPU / 32 GB (vs. GitHub's 4 vCPU / 16 GB), which roughly
+# halves Envoy compile time and gives enough RAM to raise bazel --jobs without
+# link-time OOM.
+#
+# It reuses the exact same build path as GitHub Actions:
+#   ci/run_envoy_docker.sh ci/naive_build_in_docker.sh
+# (official envoy-build image, minimal extension allowlist, wasm disabled), then
+# stores envoy-min (+ unstripped) as CircleCI artifacts. The machine executor is
+# required because that wrapper runs docker-in-docker.
+
+jobs:
+  build-naive-server:
+    machine:
+      image: ubuntu-2404:current
+    resource_class: xlarge # 8 vCPU / 32 GB LinuxVM
+    # Envoy + BoringSSL from a cold cache can take a while; give it headroom
+    # under the Performance-plan 3h job cap.
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - bazel-v1-{{ checksum "bazel/repository_locations.bzl" }}-{{ checksum ".bazelversion" }}
+            - bazel-v1-
+
+      - run:
+          name: Build envoy-static (minimal allowlist, wasm disabled)
+          no_output_timeout: 150m
+          command: |
+            set -euo pipefail
+            mkdir -p /tmp/envoy-docker-build
+            export ENVOY_DOCKER_BUILD_DIR=/tmp/envoy-docker-build
+            # naive_build_in_docker.sh auto-detects the 8 cores / 32 GB of the
+            # xlarge machine (nproc + /proc/meminfo) and sizes bazel --jobs /
+            # --local_ram_resources accordingly -- no manual tuning needed.
+            ./ci/run_envoy_docker.sh ci/naive_build_in_docker.sh
+            cp /tmp/envoy-docker-build/envoy-min ./envoy-min
+            cp /tmp/envoy-docker-build/envoy-unstripped ./envoy-unstripped || true
+            ls -lh envoy-min
+
+      - save_cache:
+          key: bazel-v1-{{ checksum "bazel/repository_locations.bzl" }}-{{ checksum ".bazelversion" }}
+          paths:
+            - /tmp/envoy-docker-build/bazel-disk
+            - /tmp/envoy-docker-build/bazel-repo
+
+      - store_artifacts:
+          path: envoy-min
+          destination: envoy-min
+
+      - store_artifacts:
+          path: envoy-unstripped
+          destination: envoy-unstripped
+
+workflows:
+  build:
+    jobs:
+      - build-naive-server
