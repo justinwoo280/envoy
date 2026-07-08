@@ -1,0 +1,129 @@
+# Release the minimal NaiveProxy-REALITY Envoy server for Linux amd64 + arm64.
+#
+# Why this exists (vs. build-naive-server.yml): that workflow builds a single
+# amd64 binary as a throwaway CI artifact. THIS workflow is the release path --
+# it builds BOTH architectures on GitHub's free runners and attaches the
+# stripped binaries to the GitHub Release, matching how the naiveproxy client
+# plugin ships.
+#
+# Runners (both free for public repos, native -- no QEMU):
+#   * amd64 -> ubuntu-latest        (4 vCPU / 16 GB)
+#   * arm64 -> ubuntu-24.04-arm     (native arm64; free on public repos)
+#
+# The official envoyproxy/envoy-build image pinned in .github/config.yml is a
+# multi-arch manifest list (linux/amd64 + linux/arm64), so the SAME image digest
+# resolves to the right architecture on each runner automatically -- no per-arch
+# image handling needed. naive_build_in_docker.sh auto-sizes bazel --jobs /
+# --local_ram_resources from nproc + /proc/meminfo, so it's correctly tuned for
+# the 16 GB runner (it lowers --jobs to avoid link-time OOM).
+#
+# Trigger: publishing a GitHub Release (on: release / published). Can also be
+# run manually (workflow_dispatch) against a ref to (re)build without releasing,
+# in which case the release-upload step is skipped (binaries stay as artifacts).
+#
+# NOTE: your plugin + patches (naive_forward_proxy filter, reality handshaker,
+# reality_authenticator listener filter, boringssl-reality.patch, naive proto)
+# must be COMMITTED on the ref being built -- CI checks out the committed tree.
+
+name: release-naive-server
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "git ref (tag/branch/sha) to build"
+        required: true
+        type: string
+      compile_mode:
+        description: "bazel -c mode"
+        default: "opt"
+        type: choice
+        options: [opt, fastbuild]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write # required to upload assets to the Release
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 350 # under the 360-min hard cap
+    steps:
+      - name: Checkout (with committed plugin + patches)
+        uses: actions/checkout@v4
+        with:
+          # For a release event this is the tag; for manual runs, the input ref.
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      # Envoy's build tree + bazel cache easily exceeds the ~14 GB free on a
+      # stock runner. Reclaim ~25 GB by removing preinstalled toolchains we
+      # don't need. (Harmless if a path is absent, e.g. on the arm image.)
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
+                      /usr/lib/jvm || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      # Cache the docker build dir (bazel disk + repo caches live under /build
+      # inside the container, mounted to /tmp/envoy-docker-build on the host).
+      # Keyed per-arch so amd64 and arm64 don't clobber each other's cache.
+      - name: Cache bazel build dir
+        uses: actions/cache@v4
+        with:
+          path: /tmp/envoy-docker-build
+          key: bazel-${{ matrix.arch }}-${{ hashFiles('bazel/repository_locations.bzl', '.bazelversion', 'WORKSPACE') }}
+          restore-keys: |
+            bazel-${{ matrix.arch }}-
+
+      - name: Build envoy-static (minimal allowlist, wasm disabled)
+        env:
+          COMPILE_MODE: ${{ github.event.inputs.compile_mode || 'opt' }}
+          ENVOY_DOCKER_BUILD_DIR: /tmp/envoy-docker-build
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/envoy-docker-build
+          # The multi-arch envoy-build image resolves to this runner's arch
+          # automatically. naive_build_in_docker.sh auto-sizes bazel --jobs /
+          # --local_ram_resources from nproc + /proc/meminfo.
+          ./ci/run_envoy_docker.sh ci/naive_build_in_docker.sh
+          cp /tmp/envoy-docker-build/envoy-min ./envoy-min-linux-${{ matrix.arch }}
+          cp /tmp/envoy-docker-build/envoy-unstripped ./envoy-unstripped-linux-${{ matrix.arch }} || true
+          ls -lh envoy-min-linux-${{ matrix.arch }}
+          ./envoy-min-linux-${{ matrix.arch }} --version || true
+
+      # Always keep the binaries as run artifacts (useful for manual runs and as
+      # a fallback if the release upload is skipped).
+      - name: Upload run artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: envoy-min-linux-${{ matrix.arch }}
+          path: |
+            envoy-min-linux-${{ matrix.arch }}
+            envoy-unstripped-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 14
+
+      # On a release event, attach the stripped binary (per arch) to the Release.
+      - name: Attach binary to the Release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            "envoy-min-linux-${{ matrix.arch }}" \
+            --clobber
