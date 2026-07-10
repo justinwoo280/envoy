@@ -13,6 +13,7 @@
 
 #include "absl/strings/escaping.h"
 #include "absl/types/span.h"
+#include "source/common/common/hex.h"
 #include "openssl/ssl.h"
 
 namespace Envoy {
@@ -36,15 +37,19 @@ Config::Config(
     const envoy::extensions::filters::listener::reality_authenticator::v3::RealityAuthenticator&
         proto_config)
     : ssl_ctx_(SSL_CTX_new(TLS_with_buffers_method())) {
+  // REALITY ecosystem encoding: private_key is base64url (Go RawURLEncoding, as
+  // printed by `xray x25519` / sing-box), short_id is a hex string. This lets a
+  // deployment reuse the exact same key/short_id strings across sing-box, the
+  // naive client, and this server with no conversion.
   std::string pk;
-  if (!absl::Base64Unescape(proto_config.private_key(), &pk) || pk.size() != 32) {
-    throw EnvoyException("reality_authenticator: private_key must be base64 of 32 bytes");
+  if (!absl::WebSafeBase64Unescape(proto_config.private_key(), &pk) || pk.size() != 32) {
+    throw EnvoyException("reality_authenticator: private_key must be base64url of 32 bytes");
   }
   private_key_.assign(pk.begin(), pk.end());
 
-  std::string sid;
-  if (!absl::Base64Unescape(proto_config.short_id(), &sid) || sid.empty() || sid.size() > 8) {
-    throw EnvoyException("reality_authenticator: short_id must be base64 of 1..8 bytes");
+  std::vector<uint8_t> sid = Hex::decode(proto_config.short_id());
+  if (sid.empty() || sid.size() > 8) {
+    throw EnvoyException("reality_authenticator: short_id must be a hex string of 1..8 bytes");
   }
   short_id_.assign(sid.begin(), sid.end());
 

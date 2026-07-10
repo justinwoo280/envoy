@@ -19,6 +19,7 @@ envoy_cc_library(
     external_deps = ["ssl"],
     visibility = ["//visibility:public"],
     deps = [
+        "@abseil-cpp//absl/strings",
         "@abseil-cpp//absl/types:span",
     ],
 )
@@ -44,6 +45,7 @@ envoy_cc_extension(
         "//envoy/registry",
         "//envoy/ssl:handshaker_interface",
         "//source/common/api:os_sys_calls_lib",
+        "//source/common/common:hex_lib",
         "//source/common/common:utility_lib",
         "//source/common/network:address_lib",
         "//source/common/network:utility_lib",

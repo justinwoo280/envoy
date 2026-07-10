@@ -11,27 +11,41 @@ anti-active-probing fallback design see `DESIGN_REALITY_FALLBACK.md`.
 ## Step 0 — Generate the keys (do this once)
 
 REALITY needs an X25519 key pair (server keeps the private half, client gets the
-public half) and a shared `short_id`. Generate all three with `openssl` +
-`python3` (no extra tools):
+public half) and a shared `short_id`. The encoding matches the rest of the
+REALITY ecosystem so the same strings are reused verbatim across this server,
+the naive client, and sing-box:
+
+- keys: **base64url** (Go RawURLEncoding), exactly what `xray x25519` prints
+- short_id: a **hex** string, 1..8 bytes (2..16 hex chars)
+
+The simplest way is the standard tool (also used by Xray/sing-box):
 
 ```sh
-# X25519 key pair
-openssl genpkey -algorithm X25519 -out reality.pem
+# X25519 key pair (PrivateKey -> server, Password/PublicKey -> client)
+xray x25519
 
+# short_id: any 1..8 random bytes as hex (server and client must match)
+openssl rand -hex 8
+```
+
+Or with openssl + python (no xray), producing the same base64url encoding:
+
+```sh
+openssl genpkey -algorithm X25519 -out reality.pem
 python3 - <<'PY'
 import base64, subprocess
-der  = subprocess.check_output(["openssl","pkey","-in","reality.pem","-outform","DER"])
-pub  = subprocess.check_output(["openssl","pkey","-in","reality.pem","-pubout","-outform","DER"])
-print("private_key (server):", base64.b64encode(der[-32:]).decode())
-print("public_key  (client):", base64.b64encode(pub[-32:]).decode())
+der = subprocess.check_output(["openssl","pkey","-in","reality.pem","-outform","DER"])
+pub = subprocess.check_output(["openssl","pkey","-in","reality.pem","-pubout","-outform","DER"])
+b64u = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+print("private_key (server, base64url):", b64u(der[-32:]))
+print("public_key  (client, base64url):", b64u(pub[-32:]))
 PY
-
-# short_id: any 1..8 random bytes, base64 (server and client must match)
-openssl rand 8 | base64
+openssl rand -hex 8   # short_id (hex)
 ```
 
 Keep `private_key` on the server, give `public_key` to the client, and put the
-same `short_id` on both.
+same `short_id` (hex) on both. These are the identical strings you would use in
+an Xray/sing-box REALITY config — no conversion.
 
 ---
 
@@ -68,8 +82,8 @@ static_resources:
     - name: envoy.filters.listener.reality_authenticator
       typed_config:
         "@type": type.googleapis.com/envoy.extensions.filters.listener.reality_authenticator.v3.RealityAuthenticator
-        private_key: "<base64 X25519 private key>"
-        short_id: "<base64 short id>"
+        private_key: "<base64url X25519 private key>"
+        short_id: "<hex short id>"
         max_time_diff_seconds: 90
     # Route on the auth verdict:
     #   authenticated == "true"  -> reality chain (tunnel)
@@ -135,8 +149,8 @@ static_resources:
               name: envoy.tls_handshakers.reality
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.transport_sockets.reality.v3.RealityConfig
-                private_key: "<base64 X25519 private key>"   # same as above
-                short_id: "<base64 short id>"                # same as above
+                private_key: "<base64url X25519 private key>"   # same as above
+                short_id: "<hex short id>"                # same as above
                 mirror_target: "www.apple.com:443"           # (5) live mirror
                 mirror_dial_timeout_seconds: 5
                 max_time_diff_seconds: 90

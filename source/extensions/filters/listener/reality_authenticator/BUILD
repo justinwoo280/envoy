@@ -26,6 +26,7 @@ envoy_cc_library(
         "//envoy/network:listen_socket_interface",
         "//envoy/stream_info:filter_state_interface",
         "//source/common/common:assert_lib",
+        "//source/common/common:hex_lib",
         "//source/common/common:minimal_logger_lib",
         "//source/common/protobuf",
         "//source/common/router:string_accessor_lib",

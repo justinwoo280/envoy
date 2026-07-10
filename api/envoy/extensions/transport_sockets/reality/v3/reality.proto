@@ -22,13 +22,17 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 // TLS certificates into the SSL_CTX — the handshaker injects a per-connection
 // temporary trusted certificate instead.
 message RealityConfig {
-  // X25519 private key (raw 32 bytes) used for REALITY auth key exchange.
-  // The corresponding public key is distributed to REALITY clients.
-  bytes private_key = 1;
+  // X25519 private key used for REALITY auth key exchange, as base64url (Go
+  // RawURLEncoding, i.e. the string printed by ``xray x25519`` / sing-box).
+  // Decodes to 32 raw bytes. The corresponding public key is distributed to
+  // REALITY clients. Same encoding as the naive client and sing-box, so one
+  // string is reused verbatim across the whole deployment.
+  string private_key = 1 [(validate.rules).string = {min_len: 1}];
 
-  // Short ID (up to 8 bytes) that the client must present in the encrypted
-  // session_id. Connections with a mismatched short_id are rejected.
-  bytes short_id = 2;
+  // Short ID that the client must present in the encrypted session_id, as a hex
+  // string (Xray/sing-box convention), decoding to 1..8 bytes. Connections with
+  // a mismatched short_id are rejected.
+  string short_id = 2 [(validate.rules).string = {min_len: 1}];
 
   // Static fallback mirror ServerHello handshake message (raw bytes, including
   // the 4-byte handshake header). Captured beforehand from the real target.

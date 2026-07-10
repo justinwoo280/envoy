@@ -11,7 +11,10 @@
 #include "envoy/common/exception.h"
 
 #include "source/common/common/fmt.h"
+#include "source/common/common/hex.h"
 #include "source/common/network/dns_resolver/dns_factory_util.h"
+
+#include "absl/strings/escaping.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -22,25 +25,28 @@ RealityConfig::RealityConfig(
     const envoy::extensions::transport_sockets::reality::v3::RealityConfig& proto, Api::Api& api)
     : api_(api),
       dns_resolver_factory_(Network::createDefaultDnsResolverFactory(dns_resolver_config_)) {
-  private_key_ = std::vector<uint8_t>(proto.private_key().begin(), proto.private_key().end());
-  short_id_ = std::vector<uint8_t>(proto.short_id().begin(), proto.short_id().end());
-  mirror_server_hello_ =
-      std::vector<uint8_t>(proto.mirror_server_hello().begin(), proto.mirror_server_hello().end());
-  mirror_target_ = proto.mirror_target();
-
-  // Validate the X25519 private key length. A wrong length would silently
-  // produce a garbage shared secret (and thus break auth) or read OOB.
-  if (private_key_.size() != 32) {
+  // REALITY ecosystem encoding: private_key is base64url (Go RawURLEncoding, as
+  // printed by `xray x25519` / sing-box), short_id is a hex string. The same
+  // strings are reused verbatim by the naive client and sing-box.
+  std::string pk;
+  if (!absl::WebSafeBase64Unescape(proto.private_key(), &pk) || pk.size() != 32) {
     throw EnvoyException(fmt::format(
-        "REALITY private_key must be exactly 32 bytes, got {}", private_key_.size()));
+        "REALITY private_key must be base64url decoding to 32 bytes, got {}", pk.size()));
   }
+  private_key_ = std::vector<uint8_t>(pk.begin(), pk.end());
+
+  short_id_ = Hex::decode(proto.short_id());
   // The short_id gates authentication. An empty short_id previously meant
   // "accept any client", which is an authentication bypass in production.
   // Require a non-empty, at-most-8-byte short_id.
   if (short_id_.empty() || short_id_.size() > 8) {
     throw EnvoyException(fmt::format(
-        "REALITY short_id must be 1..8 bytes, got {}", short_id_.size()));
+        "REALITY short_id must be a hex string of 1..8 bytes, got {} bytes", short_id_.size()));
   }
+
+  mirror_server_hello_ =
+      std::vector<uint8_t>(proto.mirror_server_hello().begin(), proto.mirror_server_hello().end());
+  mirror_target_ = proto.mirror_target();
   // At least one mirror source must be configured: a live target to dial, or a
   // static ServerHello to emit (also used as the live-capture fallback).
   if (mirror_server_hello_.empty() && mirror_target_.empty()) {
