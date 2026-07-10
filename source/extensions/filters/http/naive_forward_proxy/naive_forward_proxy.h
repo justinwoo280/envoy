@@ -163,7 +163,6 @@ private:
   void createUdpSocket(Network::Address::InstanceConstSharedPtr address);
   void onUdpReadable();
   void relayUotFrameToUdp(const UotFrame& frame);
-  void sendUotHandshakeEcho();
 
   // ---- Padding helpers ----
   void stripPadding(Buffer::Instance& in, std::string& out);
@@ -217,7 +216,6 @@ private:
   bool udp_is_connect_ = true; // isConnect mode from handshake
   HostPort udp_dest_;          // destination from UoT handshake
   UotDecoder uot_decoder_;
-  bool uot_handshake_echo_sent_ = false;
 
   // DNS. The resolver is created lazily on this filter's worker thread (never
   // shared across threads) and returns the worker-thread-bound resolver.

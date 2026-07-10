@@ -497,24 +497,14 @@ void NaiveForwardProxyFilter::onUotHandshake(const UotFrame& frame) {
   ENVOY_LOG(info, "naive_forward_proxy: UoT handshake: isConnect={} dest={}:{}",
             udp_is_connect_, udp_dest_.host, udp_dest_.port);
 
-  // Send handshake echo back to client (with padding)
-  sendUotHandshakeEcho();
+  // NOTE: we deliberately do NOT echo a handshake back to the client. Standard
+  // sing-box UoT servers send data frames directly after reading the request;
+  // an echo was a non-standard deviation that broke interop with sing-box (and
+  // with any standard UoT peer). The client's return-direction framer decodes
+  // data frames directly.
 
   // Start DNS resolution for UDP destination
   startUdpDnsResolve(udp_dest_);
-}
-
-void NaiveForwardProxyFilter::sendUotHandshakeEcho() {
-  if (uot_handshake_echo_sent_) return;
-  uot_handshake_echo_sent_ = true;
-
-  std::string echo = encodeHandshake(udp_is_connect_, udp_dest_);
-  if (padding_enabled_ && padding_encoder_.encodePaddingActive()) {
-    echo = padding_encoder_.encode(echo, randomPaddingSize());
-  }
-  Buffer::OwnedImpl buf;
-  buf.add(echo.data(), echo.size());
-  decoder_callbacks_->encodeData(buf, false);
 }
 
 void NaiveForwardProxyFilter::startUdpDnsResolve(const HostPort& dest) {
