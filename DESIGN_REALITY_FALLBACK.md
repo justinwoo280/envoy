@@ -208,4 +208,87 @@ read it back — an optimization, not required for correctness.
 4. **Half-open / RST semantics** on the fallback pipe should mirror xtls
    (propagate FIN as CloseWrite, RST as Close) to avoid a distinguishable
    teardown signature.
+5. **Relay-traffic cost of a global-anycast CDN dest — a bandwidth/reputation
+   cost, NOT an insecurity. Governed by the dest CDN's anycast scope.** This is
+   the most consequential dest-*selection* trade-off, distinct from the timing
+   concern in (1).
+
+   **Mechanism.** When a ClientHello's SNI is not in the server's `serverNames`
+   allowlist, REALITY does not authenticate — it L4-passes-through the connection
+   to the **fixed configured `dest`** (not to whatever the SNI resolves to; the
+   dial target is `config.Dest`, verified in `xtls/reality` `tls.go:Server()` and
+   in the sing-box / naive-Envoy adapters). The subtlety is entirely on the far
+   end: if that fixed `dest` is a **shared anycast CDN edge**, that edge itself
+   routes by the *forwarded* SNI/Host and will happily serve **any tenant it
+   hosts**. So the reachable set through our node equals *the CDN edge's own
+   tenant set*, scaled by the CDN's anycast breadth.
+
+   - **Global anycast (Cloudflare, Fastly, CloudFront):** every customer origin
+     is reachable from every edge ⇒ our node can relay to the CDN's *entire*
+     customer base. An attacker just deploys their own origin on the CDN (free
+     account, SNI == Host, valid cert) and relays it through us — the CDN's
+     anti-domain-fronting `421` (SNI ≠ Host) never triggers, so it does not help.
+   - **Segmented anycast (Akamai network maps):** an edge serves only a *local*
+     tenant subset ⇒ exposure is bounded to that map, and the enterprise
+     contract barrier stops a casual abuser from placing a relay origin at all.
+
+   **This is a cost, not a break — and imitating it is REQUIRED.** Presenting a
+   real CDN edge's multi-tenant behaviour is *correct camouflage*: a genuine
+   Akamai/CloudFront edge also serves many unrelated domains and returns
+   `alert 80` with no SNI. If our node did **not** do this (e.g. forced a single
+   fixed SNI and rejected everything else), it would look *unlike* the CDN edge it
+   claims to be — a worse, distinguishing tell. So the behaviour is not a
+   vulnerability in the anti-probing sense; the node stays indistinguishable from
+   the real edge. The only price is **traffic**: an attacker can spend some of our
+   bandwidth (and stake our IP reputation) relaying their own CDN traffic through
+   us. Security (unobservability) is intact; cost (relayed bytes) is the tax you
+   pay for borrowing a global-anycast CDN's fingerprint.
+
+   **Measured evidence.**
+
+   - *Live node, dest `cloud.oracle.com` on Akamai (`104.64.217.156`):* no SNI →
+     `alert 80`, byte-identical to a real Akamai edge (`23.215.x`); SNI ≠ Host
+     (`crypto.cloudflare.com` / `www.cloudflare.com`) → `421`, identical to real
+     CF; an attacker's own CF origin `r2.azstu.vip` (SNI == Host) → real attacker
+     cert + `200` `server: cloudflare`, 3771 B — relayed to an arbitrary CF
+     origin because CF is global anycast.
+   - *Local node, dest `aws.amazon.com` on CloudFront:* unrelated CloudFront
+     tenants were served through the node — `www.nytimes.com` → real
+     `CN=nytimes.com` cert, `d1.awsstatic.com` → real cert; a non-CloudFront SNI
+     `developer.mozilla.org` → `alert 40`. Confirms the reachable set = the CDN's
+     tenant set.
+   - *Cross-implementation control — this is REALITY-inherent, not a sing-box /
+     naive / Envoy bug:* the **official Xray-core VLESS+REALITY** server
+     (v26.3.27) with the same CloudFront dest reproduced it **identically** —
+     `aws.amazon.com` ✓ (real cert), `www.nytimes.com` ✓ (real `CN=nytimes.com`),
+     `d1.awsstatic.com` ✓, `developer.mozilla.org` → `alert 40`. All three stacks
+     behave the same because it is a property of REALITY-pass-through × the dest
+     CDN's anycast scope, which no implementation can change.
+
+   **Guidance — dest selection priority (best → worst):**
+
+   1. **Single-origin neighbour (preferred).** A network-close site on its own
+      origin (no CDN multi-tenancy) has no relay surface at all: an off-allowlist
+      SNI can only be forwarded to that one origin, which rejects it. Best on both
+      the timing axis (a close "neighbour", the classic RealiTLScanner target) and
+      the relay-cost axis. First choice whenever a suitable close single-origin
+      dest exists.
+   2. **Segmented / high-barrier CDN (acceptable) — e.g. Akamai.** Bounded relay
+      surface (local network-map tenant subset only) *and* an enterprise contract
+      barrier that stops casual abusers from planting a relay origin. Keeps the
+      CDN's proximity/edge benefits; accept that it leaks the *local* co-tenant
+      set to probing.
+   3. **Global-anycast CDN (least recommended) — Cloudflare / Fastly /
+      CloudFront.** Works and stays unobservable, but turns the node into a
+      potential reverse proxy for the CDN's *entire* customer base. Only the
+      bandwidth/reputation cost, not detectability, but the cost is unbounded
+      (any tenant, any free-account origin). Avoid unless you accept being an open
+      relay for that CDN.
+
+   **Test a candidate:** relay an origin you control on the candidate CDN through
+   a spare node (`--resolve your-origin:443:<node-ip>`); a `200` with your own
+   cert means the edge is broadly anycast-reachable (tier 3). This axis pulls
+   *against* the timing criterion in (1) (which favours a close, often big-CDN
+   dest); resolve it by preferring a close **single-origin** dest, or a
+   **segmented** CDN, over a global-anycast one.
 ```

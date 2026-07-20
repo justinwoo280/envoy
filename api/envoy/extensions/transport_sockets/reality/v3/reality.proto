@@ -64,4 +64,17 @@ message RealityConfig {
   // defaults to 5 seconds. On timeout the handshaker falls back to
   // ``mirror_server_hello`` (or fails the connection if none is set).
   uint32 mirror_dial_timeout_seconds = 6;
+
+  // Minimum client version accepted, as 3 bytes (the ``[x, y, z]`` tuple the
+  // client embeds in the encrypted session_id). Connections whose decrypted
+  // version compares (big-endian, most-significant byte first) below this are
+  // rejected. Mirrors REALITY's ``MinClientVer``. If unset (empty), no lower
+  // bound is enforced. Must be exactly 3 bytes when set.
+  bytes min_client_version = 7 [(validate.rules).bytes = {len: 3 ignore_empty: true}];
+
+  // Maximum client version accepted, as 3 bytes. Connections whose decrypted
+  // version compares above this are rejected. Mirrors REALITY's
+  // ``MaxClientVer``. If unset (empty), no upper bound is enforced. Must be
+  // exactly 3 bytes when set.
+  bytes max_client_version = 8 [(validate.rules).bytes = {len: 3 ignore_empty: true}];
 }

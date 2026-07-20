@@ -22,7 +22,9 @@ namespace Reality {
 // session. See reality_auth.h.
 bool realityVerifyAuth(const SSL_CLIENT_HELLO* client_hello,
                        absl::Span<const uint8_t> private_key, absl::Span<const uint8_t> short_id,
-                       uint32_t max_time_diff_seconds, RealityAuthResult* out) {
+                       uint32_t max_time_diff_seconds,
+                       absl::Span<const uint8_t> min_client_version,
+                       absl::Span<const uint8_t> max_client_version, RealityAuthResult* out) {
   if (private_key.size() != 32) {
     return false;
   }
@@ -151,6 +153,22 @@ bool realityVerifyAuth(const SSL_CLIENT_HELLO* client_hello,
 
   // 5. Verify plaintext: ver[0:3] + reserved[3] + time[4:8 BE] + shortId[8:16].
   if (plaintext.size() < 16) {
+    return false;
+  }
+
+  // 5-version. Enforce MinClientVer / MaxClientVer against plaintext[0:3].
+  // The version is a 3-byte tuple compared big-endian (most-significant byte
+  // first), matching REALITY's Value() helper. Empty bounds are not enforced.
+  const uint8_t* ver = plaintext.data();
+  const auto ver_value = [](const uint8_t* v) -> uint32_t {
+    return (static_cast<uint32_t>(v[0]) << 16) | (static_cast<uint32_t>(v[1]) << 8) |
+           static_cast<uint32_t>(v[2]);
+  };
+  const uint32_t client_ver = ver_value(ver);
+  if (min_client_version.size() == 3 && client_ver < ver_value(min_client_version.data())) {
+    return false;
+  }
+  if (max_client_version.size() == 3 && client_ver > ver_value(max_client_version.data())) {
     return false;
   }
 

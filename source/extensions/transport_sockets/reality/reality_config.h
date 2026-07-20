@@ -52,6 +52,11 @@ struct RealityConfig {
   // Maximum allowed |client_time - now| in seconds for anti-replay.
   uint32_t maxTimeDiffSeconds() const { return max_time_diff_seconds_; }
 
+  // Minimum / maximum accepted client version (3 bytes each, or empty = no
+  // bound). Compared big-endian against the decrypted session_id version tuple.
+  const std::vector<uint8_t>& minClientVersion() const { return min_client_version_; }
+  const std::vector<uint8_t>& maxClientVersion() const { return max_client_version_; }
+
   // Ed25519 private key (EVP_PKEY, for CertificateVerify)
   EVP_PKEY* ed25519PrivateKey() const { return ed25519_pkey_.get(); }
 
@@ -70,6 +75,8 @@ private:
   std::string mirror_target_;              // "host:port", empty = static mode
   uint32_t mirror_dial_timeout_seconds_{5};
   uint32_t max_time_diff_seconds_{90};
+  std::vector<uint8_t> min_client_version_; // empty = no lower bound
+  std::vector<uint8_t> max_client_version_; // empty = no upper bound
 
   bssl::UniquePtr<EVP_PKEY> ed25519_pkey_;
   std::vector<uint8_t> ed25519_pub_;       // raw 32 bytes

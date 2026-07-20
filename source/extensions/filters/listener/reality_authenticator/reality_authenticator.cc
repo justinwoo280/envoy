@@ -65,9 +65,13 @@ Config::Config(
         Filter* filter =
             static_cast<Filter*>(SSL_get_ex_data(client_hello->ssl, realitySslFilterIndex()));
         const Config& cfg = *filter->config_;
+        // The L4 authenticator gates fallback routing on the core crypto
+        // verdict only; client-version bounds (MinClientVer/MaxClientVer) are a
+        // transport-socket concern and are not enforced here (empty spans).
         const bool ok = TransportSockets::Reality::realityVerifyAuth(
             client_hello, absl::MakeConstSpan(cfg.privateKey()),
-            absl::MakeConstSpan(cfg.shortId()), cfg.maxTimeDiffSeconds(), /*out=*/nullptr);
+            absl::MakeConstSpan(cfg.shortId()), cfg.maxTimeDiffSeconds(),
+            /*min_client_version=*/{}, /*max_client_version=*/{}, /*out=*/nullptr);
         filter->setAuthenticated(ok);
         // Always abort: we only parse+authenticate, never terminate TLS here.
         return ssl_select_cert_error;

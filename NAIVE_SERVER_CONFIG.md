@@ -242,12 +242,43 @@ not cosmetic:
 - **Must be network-close to your VPS.** A prober can compare "connecting to you"
   vs "connecting to the dest directly"; if your server→dest round-trip is large,
   the timing difference is observable. Aim for `server→dest` RTT well under
-  ~10 ms. Big CDNs (apple / microsoft / cloudflare) have edge nodes almost
-  everywhere, so they are close to most VPS locations.
+  ~10 ms. Big CDNs (apple / microsoft) have edge nodes almost everywhere, so
+  they are close to most VPS locations.
+- **Mind the relay-traffic cost of a global-anycast CDN dest.** When an
+  off-allowlist SNI arrives, REALITY forwards it to your **fixed** `dest`. If
+  that dest is a *shared anycast CDN edge*, the edge routes the forwarded
+  SNI/Host to whatever tenant it hosts — so your node can relay to that CDN's
+  tenant set. On a **global-anycast CDN (Cloudflare / Fastly / CloudFront)** that
+  is the CDN's *entire* customer base: an attacker deploys their own origin on
+  the CDN (free account, SNI == Host — so the CDN's anti-domain-fronting `421`
+  never triggers) and relays it through you, spending your bandwidth and IP
+  reputation. *Verified across sing-box, naive-Envoy, and the official Xray-core
+  — this is inherent to REALITY + a global-anycast dest, not an implementation
+  bug.*
+- **This is a cost, not an insecurity — and you MUST imitate it.** Serving a real
+  CDN edge's multi-tenant behaviour (many domains, `alert 80` on no-SNI) is
+  *correct camouflage*; a genuine CDN edge does exactly this. Forcing a single
+  fixed SNI and rejecting everything else would make your node look *unlike* the
+  edge it imitates — a worse, distinguishing tell. So you stay unobservable; you
+  only pay in *relayed traffic*.
 - **Avoid** obscure single-datacenter sites (likely far from your VPS → timing
   leak) and sites that reject unknown SNI at the edge.
-- **Rule of thumb:** pick a large CDN-fronted site that is popular in your VPS's
-  region. See `DESIGN_REALITY_FALLBACK.md` for the timing analysis.
+- **Dest priority (best → worst):**
+  1. **Single-origin neighbour (preferred).** A network-close site on its own
+     origin: no multi-tenancy, so no relay surface at all. Best on both the
+     timing axis and the relay-cost axis.
+  2. **Segmented / high-barrier CDN (acceptable) — e.g. Akamai.** Edges serve
+     only a bounded local tenant set, and the enterprise contract barrier stops a
+     casual abuser ("白嫖狗") from planting a relay origin. Keeps the CDN's
+     proximity benefits; leaks only the local co-tenant set.
+  3. **Global-anycast CDN (least recommended) — Cloudflare / Fastly /
+     CloudFront.** Still unobservable, but becomes a potential open relay for the
+     CDN's entire customer base. Only a bandwidth/reputation cost, but an
+     unbounded one — avoid unless you accept that.
+  This axis pulls *against* "network-close" (which favours big CDNs); resolve it
+  by preferring a close **single-origin** dest, or a **segmented** CDN, over a
+  global-anycast one. See `DESIGN_REALITY_FALLBACK.md` §"Open questions / risks"
+  #5 for the full analysis, measured evidence, and the Xray-core cross-check.
 
 ---
 

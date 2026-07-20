@@ -227,7 +227,8 @@ bool RealityHandshaker::extractAndVerifyAuth(const SSL_CLIENT_HELLO* client_hell
   RealityAuthResult result;
   if (!realityVerifyAuth(client_hello, absl::MakeConstSpan(config_->privateKey()),
                          absl::MakeConstSpan(config_->shortId()), config_->maxTimeDiffSeconds(),
-                         &result)) {
+                         absl::MakeConstSpan(config_->minClientVersion()),
+                         absl::MakeConstSpan(config_->maxClientVersion()), &result)) {
     return false;
   }
   auth_key_ = std::move(result.auth_key);

@@ -66,6 +66,24 @@ RealityConfig::RealityConfig(
     max_time_diff_seconds_ = proto.max_time_diff_seconds();
   }
 
+  // Optional client version bounds (3 bytes each). PGV enforces len==3 when set,
+  // but guard here too so a malformed config fails loudly rather than silently
+  // disabling the check.
+  if (!proto.min_client_version().empty()) {
+    if (proto.min_client_version().size() != 3) {
+      throw EnvoyException("REALITY min_client_version must be exactly 3 bytes");
+    }
+    min_client_version_.assign(proto.min_client_version().begin(),
+                               proto.min_client_version().end());
+  }
+  if (!proto.max_client_version().empty()) {
+    if (proto.max_client_version().size() != 3) {
+      throw EnvoyException("REALITY max_client_version must be exactly 3 bytes");
+    }
+    max_client_version_.assign(proto.max_client_version().begin(),
+                               proto.max_client_version().end());
+  }
+
   generateEd25519();
 }
 
