@@ -3,10 +3,12 @@
 #include <openssl/asn1.h>
 #include <openssl/bio.h>
 #include <openssl/evp.h>
+#include <openssl/obj.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 
 #include <ctime>
+#include <limits>
 
 #include "envoy/common/exception.h"
 
@@ -94,6 +96,142 @@ RealityConfig::createDnsResolver(Event::Dispatcher& dispatcher) const {
       Network::DnsResolverSharedPtr);
 }
 
+std::vector<uint8_t> RealityConfig::makeSelfSignedCert(size_t dummy_ext_len,
+                                                       unsigned serial_extra_bytes) const {
+  // Minimal self-signed ed25519 certificate (like REALITY Go's init()):
+  // serial 0, empty subject == empty issuer.
+  bssl::UniquePtr<X509> cert(X509_new());
+  if (cert == nullptr) {
+    return {};
+  }
+  X509_set_version(cert.get(), 2); // v3
+  // The serial's DER width is the fine-grained size knob: 0 encodes in 3 bytes,
+  // 0x0100 in 4, 0x010000 in 5. It absorbs the off-by-one or two that the
+  // extension payload alone cannot reach when a length prefix widens.
+  long serial = 0;
+  for (unsigned i = 0; i < serial_extra_bytes; i++) {
+    serial = (serial == 0) ? 0x0100 : serial << 8;
+  }
+  ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), serial);
+  X509_gmtime_adj(X509_get_notBefore(cert.get()), 0);
+  X509_gmtime_adj(X509_get_notAfter(cert.get()), 31536000); // 1 year
+  X509_set_pubkey(cert.get(), ed25519_pkey_.get());
+  X509_NAME* name = X509_get_subject_name(cert.get());
+  X509_set_issuer_name(cert.get(), name);
+
+  if (dummy_ext_len > 0) {
+    // Non-critical extension under OID 0.0 (the same arc REALITY's Go
+    // implementation uses to reserve room for its ML-DSA-65 signature), holding
+    // `dummy_ext_len` zero bytes. Its only purpose is to move the total DER
+    // length; nothing reads it.
+    bssl::UniquePtr<ASN1_OBJECT> obj(OBJ_txt2obj("0.0", 1 /*dont_search_names*/));
+    bssl::UniquePtr<ASN1_OCTET_STRING> value(ASN1_OCTET_STRING_new());
+    if (obj == nullptr || value == nullptr) {
+      return {};
+    }
+    const std::vector<uint8_t> zeros(dummy_ext_len, 0);
+    if (ASN1_OCTET_STRING_set(value.get(), zeros.data(), static_cast<int>(zeros.size())) != 1) {
+      return {};
+    }
+    bssl::UniquePtr<X509_EXTENSION> ext(
+        X509_EXTENSION_create_by_OBJ(nullptr, obj.get(), 0 /*not critical*/, value.get()));
+    if (ext == nullptr || X509_add_ext(cert.get(), ext.get(), -1) != 1) {
+      return {};
+    }
+  }
+
+  // Sign with ed25519 (nullptr digest = one-shot, no pre-hash). The 64-byte
+  // signature is the DER's trailing 64 bytes, which the handshaker overwrites
+  // with HMAC-SHA512(AuthKey, ed25519_pub).
+  if (X509_sign(cert.get(), ed25519_pkey_.get(), nullptr) == 0) {
+    return {};
+  }
+
+  uint8_t* der = nullptr;
+  const int der_len = i2d_X509(cert.get(), &der);
+  if (der_len <= 0 || der == nullptr) {
+    return {};
+  }
+  std::vector<uint8_t> out(der, der + der_len);
+  OPENSSL_free(der);
+  return out;
+}
+
+std::vector<uint8_t> RealityConfig::buildDisguiseCert(size_t target_der_len) const {
+  if (target_der_len <= static_cert_.size() || target_der_len > kMaxDisguiseCertDerLen) {
+    return {};
+  }
+
+  std::vector<uint8_t> best;
+  size_t best_delta = std::numeric_limits<size_t>::max();
+  auto consider = [&](std::vector<uint8_t>&& der) {
+    if (der.empty()) {
+      return;
+    }
+    const size_t delta = der.size() > target_der_len ? der.size() - target_der_len
+                                                     : target_der_len - der.size();
+    if (delta < best_delta) {
+      best_delta = delta;
+      best = std::move(der);
+    }
+  };
+
+  // Two independent knobs. The extension payload is coarse: the encoded length
+  // grows one byte per payload byte, except at the 127/255/65535 length-prefix
+  // boundaries where it jumps and leaves a target unreachable. The serial number
+  // width is fine and shifts the fixed overhead by 0..2 bytes, filling those
+  // gaps. Adding an extension at all costs a fixed overhead, so a small band of
+  // targets just above the unpadded size stays unreachable; there the closest
+  // encoding is returned.
+  for (unsigned serial_extra = 0; serial_extra <= 2 && best_delta != 0; serial_extra++) {
+    size_t ext_len = target_der_len > static_cert_.size() + serial_extra
+                         ? target_der_len - static_cert_.size() - serial_extra
+                         : 1;
+    for (int i = 0; i < 8 && best_delta != 0; i++) {
+      auto der = makeSelfSignedCert(ext_len, serial_extra);
+      if (der.empty()) {
+        return {};
+      }
+      const size_t produced = der.size();
+      consider(std::move(der));
+      if (produced == target_der_len) {
+        break;
+      }
+      if (produced > target_der_len) {
+        const size_t over = produced - target_der_len;
+        if (over >= ext_len) {
+          break; // cannot shrink further
+        }
+        ext_len -= over;
+      } else {
+        ext_len += target_der_len - produced;
+      }
+    }
+    // The iteration can stall a byte or two short when a length prefix widens
+    // exactly at the boundary; probe the neighbourhood, and the minimum payload,
+    // so the result is the best encoding available.
+    for (int64_t candidate : {static_cast<int64_t>(ext_len) - 3,
+                              static_cast<int64_t>(ext_len) - 2,
+                              static_cast<int64_t>(ext_len) - 1,
+                              static_cast<int64_t>(ext_len) + 1,
+                              static_cast<int64_t>(ext_len) + 2,
+                              static_cast<int64_t>(ext_len) + 3, int64_t{1}}) {
+      if (best_delta == 0) {
+        break;
+      }
+      if (candidate <= 0) {
+        continue;
+      }
+      consider(makeSelfSignedCert(static_cast<size_t>(candidate), serial_extra));
+    }
+  }
+
+  if (best.size() < 64) {
+    return {};
+  }
+  return best;
+}
+
 void RealityConfig::generateEd25519() {
   // Generate ed25519 key pair via EVP_PKEY_CTX
   bssl::UniquePtr<EVP_PKEY_CTX> pctx(EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, nullptr));
@@ -114,27 +252,8 @@ void RealityConfig::generateEd25519() {
   }
   ed25519_pub_.resize(pub_len);
 
-  // Create a minimal self-signed ed25519 certificate (like REALITY Go's init())
-  // Serial = 0, subject/issuer empty, self-signed
-  bssl::UniquePtr<X509> cert(X509_new());
-  X509_set_version(cert.get(), 2); // v3
-  ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), 0);
-  X509_gmtime_adj(X509_get_notBefore(cert.get()), 0);
-  X509_gmtime_adj(X509_get_notAfter(cert.get()), 31536000); // 1 year
-  X509_set_pubkey(cert.get(), pkey);
-  X509_NAME* name = X509_get_subject_name(cert.get());
-  X509_set_issuer_name(cert.get(), name);
-
-  // Sign with ed25519 (nullptr digest = one-shot, no pre-hash)
-  X509_sign(cert.get(), pkey, nullptr);
-
-  // Convert to DER
-  uint8_t* der = nullptr;
-  int der_len = i2d_X509(cert.get(), &der);
-  if (der_len > 0 && der) {
-    static_cert_.assign(der, der + der_len);
-    OPENSSL_free(der);
-  } else {
+  static_cert_ = makeSelfSignedCert(0, 0);
+  if (static_cert_.empty()) {
     throw EnvoyException("REALITY: failed to serialize ed25519 certificate");
   }
   // The HMAC tail overwrite requires at least 64 trailing bytes (the ed25519

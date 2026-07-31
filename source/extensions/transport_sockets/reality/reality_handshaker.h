@@ -15,6 +15,31 @@ namespace Extensions {
 namespace TransportSockets {
 namespace Reality {
 
+// Target DER length for the Ed25519 disguise leaf so that the emitted
+// EncryptedExtensions..Finished flight is the same size as the mirror target's.
+//
+// Only the two dominant terms are matched, exactly:
+//   * Certificate — kilobytes, and the whole reason the gap is visible.
+//   * CertificateVerify — the target signs with RSA-PSS (264 bytes) or ECDSA
+//     (~78 bytes) where we sign with Ed25519 (always 72 bytes), so the
+//     difference is folded into the certificate.
+// Finished cancels out on its own: we adopt the target's cipher suite, so both
+// sides derive the same hash length. The residual is therefore
+// |our EncryptedExtensions - theirs|, a few dozen bytes on a multi-kilobyte
+// flight, versus the 5-20x mismatch an unpadded leaf produces.
+//
+// A TLS 1.3 Certificate message carrying one certificate with an empty request
+// context and empty entry extensions is:
+//   4 (handshake header) + 1 (context length) + 3 (list length)
+//     + 3 (cert_data length) + DER + 2 (entry extensions length) = 13 + DER
+// and our CertificateVerify is:
+//   4 (handshake header) + 2 (algorithm) + 2 (signature length) + 64 = 72
+//
+// Returns 0 when no meaningful target can be computed, in which case the caller
+// must emit the unpadded certificate.
+size_t realityDisguiseCertTargetDerLen(uint32_t mirror_certificate_msg_len,
+                                       uint32_t mirror_certificate_verify_msg_len);
+
 class RealityHandshaker : public Tls::SslHandshakerImpl {
 public:
   RealityHandshaker(bssl::UniquePtr<SSL> ssl, int ssl_extended_socket_info_index,
@@ -43,7 +68,8 @@ private:
   bool extractAndVerifyAuth(const SSL_CLIENT_HELLO* client_hello);
 
   // Inject temp-trusted cert (ed25519 + HMAC tail) via SSL_use_certificate_ASN1.
-  // Returns false on failure.
+  // When the mirror dial measured the target's flight, the leaf is padded so the
+  // emitted flight matches it in size. Returns false on failure.
   bool injectTempCert();
 
   // Set ed25519 private key on the SSL for CertificateVerify. Returns false on
@@ -55,9 +81,9 @@ private:
   // falls back to the static ServerHello and proceeds synchronously).
   bool startLiveMirrorDial();
   // Completion callback for the mirror dial (fires on the connection's
-  // dispatcher). Stores the captured ServerHello (or leaves mirror_sh_ empty for
-  // static fallback) and resumes the suspended handshake.
-  void onMirrorDialComplete(std::vector<uint8_t>&& server_hello);
+  // dispatcher). Stores the capture (or leaves it empty for static fallback) and
+  // resumes the suspended handshake.
+  void onMirrorDialComplete(MirrorCapture&& capture);
   // Lazily create a per-worker DNS resolver bound to this connection's
   // dispatcher (a c-ares resolver must run on the thread that resolves).
   Network::DnsResolver& dnsResolver();
@@ -73,8 +99,10 @@ private:
   std::vector<uint8_t> client_session_id_; // client's ClientHello session_id (echo in SH)
   std::vector<uint8_t> mirror_sh_;      // per-conn mirror ServerHello with session_id echoed
   uint16_t negotiated_group_{0};        // group the client offered (for dialing the mirror)
+  bool cert_injected_{false};           // guards the deferred cert/key injection
 
   // Live mirror dial state.
+  MirrorCapture mirror_capture_;
   MirrorDialerPtr mirror_dialer_;
   Network::DnsResolverSharedPtr dns_resolver_;
 };

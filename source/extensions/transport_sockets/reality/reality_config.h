@@ -63,11 +63,43 @@ struct RealityConfig {
   // Static ed25519 self-signed cert (DER, before HMAC modification)
   const std::vector<uint8_t>& staticCert() const { return static_cert_; }
 
+  // Build a self-signed Ed25519 disguise leaf whose DER encoding is
+  // `target_der_len` bytes long, by sizing a non-critical dummy extension. Used
+  // to make the emitted certificate flight the same size as the mirror target's,
+  // which mirroring the ServerHello alone does not achieve.
+  //
+  // The signature stays the last 64 bytes of the DER (X.509 puts signatureValue
+  // last), so the caller's HMAC tail overwrite is unaffected.
+  //
+  // DER length prefixes widen at 127/255/65535 boundaries. Two knobs (the dummy
+  // extension payload and the serial number's width) cover almost every target
+  // exactly; a handful of lengths where the outer prefixes widen together are
+  // reachable only to within one byte, and a small band just above the unpadded
+  // size is not reachable at all because adding an extension has a fixed cost. In
+  // those cases the closest achievable encoding is returned.
+  //
+  // Returns an empty vector if `target_der_len` is at or below the unpadded cert
+  // size or above `kMaxDisguiseCertDerLen`, in which case the caller must fall
+  // back to staticCert().
+  std::vector<uint8_t> buildDisguiseCert(size_t target_der_len) const;
+
+  // Upper bound on a padded disguise leaf. Generous enough for post-quantum
+  // certificate chains (ML-DSA-65 leaves alone run to several kilobytes) while
+  // still bounding the memory a single connection can be made to allocate.
+  static constexpr size_t kMaxDisguiseCertDerLen = 32768;
+
   // Ed25519 public key (raw 32 bytes, for HMAC computation)
   const std::vector<uint8_t>& ed25519PublicKey() const { return ed25519_pub_; }
 
 private:
   void generateEd25519();
+  // Build and self-sign the disguise leaf. `dummy_ext_len == 0` emits no
+  // extension at all, reproducing the minimal certificate byte-for-byte.
+  // `serial_extra_bytes` (0..2) widens the serial number's DER encoding, the
+  // fine-grained knob used to reach lengths the extension payload alone skips.
+  // Returns an empty vector on failure.
+  std::vector<uint8_t> makeSelfSignedCert(size_t dummy_ext_len,
+                                          unsigned serial_extra_bytes) const;
 
   std::vector<uint8_t> private_key_;       // X25519 raw private key
   std::vector<uint8_t> short_id_;

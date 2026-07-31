@@ -22,6 +22,29 @@ namespace TransportSockets {
 namespace Reality {
 
 // ---------------------------------------------------------------------------
+// Flight size matching: target DER length for the disguise leaf.
+// See the header for the derivation of the 13 and 72 constants.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr size_t kCertificateMsgOverhead = 13;
+constexpr size_t kEd25519CertificateVerifyMsgLen = 72;
+} // namespace
+
+size_t realityDisguiseCertTargetDerLen(uint32_t mirror_certificate_msg_len,
+                                       uint32_t mirror_certificate_verify_msg_len) {
+  if (mirror_certificate_msg_len <= kCertificateMsgOverhead ||
+      mirror_certificate_verify_msg_len == 0) {
+    return 0;
+  }
+  const size_t flight = static_cast<size_t>(mirror_certificate_msg_len) +
+                        static_cast<size_t>(mirror_certificate_verify_msg_len);
+  if (flight <= kCertificateMsgOverhead + kEd25519CertificateVerifyMsgLen) {
+    return 0;
+  }
+  return flight - kCertificateMsgOverhead - kEd25519CertificateVerifyMsgLen;
+}
+
+// ---------------------------------------------------------------------------
 // ex_data index for retrieving RealityHandshaker* from SSL*
 // ---------------------------------------------------------------------------
 static int g_reality_ex_data_index = []() {
@@ -120,7 +143,16 @@ bool RealityHandshaker::onRealityServerHello(const uint8_t** out, size_t* out_le
 ssl_select_cert_result_t RealityHandshaker::onSelectCertificate(
     const SSL_CLIENT_HELLO* client_hello) {
   if (state_ == State::AuthDone) {
-    // Resumed call: auth (and any live mirror dial) already done.
+    // Resumed call: auth and (in live mode) the mirror dial are done, so the
+    // target's flight sizes are known. Inject the certificate now — deferring it
+    // to this point is what lets the disguise leaf be padded to match.
+    if (!cert_injected_) {
+      if (!injectTempCert() || !injectPrivateKey()) {
+        ENVOY_LOG(error, "REALITY cert/key injection failed");
+        return ssl_select_cert_error;
+      }
+      cert_injected_ = true;
+    }
     return ssl_select_cert_success;
   }
   if (state_ == State::MirrorPending) {
@@ -134,23 +166,23 @@ ssl_select_cert_result_t RealityHandshaker::onSelectCertificate(
     return ssl_select_cert_error;
   }
 
-  // Auth OK — inject temp-trusted cert and private key
-  if (!injectTempCert() || !injectPrivateKey()) {
-    ENVOY_LOG(error, "REALITY cert/key injection failed");
-    return ssl_select_cert_error;
-  }
-
   // Live mirror: suspend the handshake, dial the real target asynchronously to
-  // capture its ServerHello, then resume. If the dial cannot be started, fall
-  // through to static mode.
+  // capture its ServerHello and measure its encrypted flight, then resume. If
+  // the dial cannot be started, fall through to static mode.
   if (config_->hasLiveMirror() && startLiveMirrorDial()) {
     state_ = State::MirrorPending;
     return ssl_select_cert_retry;
   }
 
-  // Static mode (or live dial could not start): proceed immediately. The
-  // reality_serverhello_cb will use the static mirror_server_hello.
+  // Static mode (or live dial could not start): proceed immediately with the
+  // unpadded certificate. The reality_serverhello_cb will use the static
+  // mirror_server_hello.
   state_ = State::AuthDone;
+  if (!injectTempCert() || !injectPrivateKey()) {
+    ENVOY_LOG(error, "REALITY cert/key injection failed");
+    return ssl_select_cert_error;
+  }
+  cert_injected_ = true;
   return ssl_select_cert_success;
 }
 
@@ -194,24 +226,44 @@ bool RealityHandshaker::startLiveMirrorDial() {
   mirror_dialer_ = std::make_unique<MirrorDialer>(
       dispatcher, dns_resolver_, std::move(host), port, negotiated_group_,
       std::chrono::duration_cast<std::chrono::milliseconds>(timeout),
-      [this](std::vector<uint8_t>&& sh) { onMirrorDialComplete(std::move(sh)); });
+      [this](MirrorCapture&& capture) { onMirrorDialComplete(std::move(capture)); });
   mirror_dialer_->start();
   return true;
 }
 
-void RealityHandshaker::onMirrorDialComplete(std::vector<uint8_t>&& server_hello) {
-  if (!server_hello.empty()) {
+void RealityHandshaker::onMirrorDialComplete(MirrorCapture&& capture) {
+  if (!capture.server_hello.empty()) {
     // Adopt the live-captured ServerHello; onRealityServerHello will fix up the
     // session_id and the patch replaces the key_share.
-    mirror_sh_ = std::move(server_hello);
-    ENVOY_LOG(debug, "REALITY live mirror captured: {} bytes", mirror_sh_.size());
+    mirror_capture_ = std::move(capture);
+    mirror_sh_ = mirror_capture_.server_hello;
+    if (mirror_capture_.flight_complete) {
+      ENVOY_LOG(debug,
+                "REALITY live mirror captured: ServerHello {} bytes, flight EE={} Cert={} CV={} "
+                "Fin={}",
+                mirror_sh_.size(), mirror_capture_.encrypted_extensions_len,
+                mirror_capture_.certificate_len, mirror_capture_.certificate_verify_len,
+                mirror_capture_.finished_len);
+    } else {
+      ENVOY_LOG(debug,
+                "REALITY live mirror captured: ServerHello {} bytes, flight not measured "
+                "(certificate size will not be matched)",
+                mirror_sh_.size());
+    }
   } else {
     // Live capture failed: leave mirror_sh_ empty so onRealityServerHello falls
     // back to the static config (if present).
+    mirror_capture_ = MirrorCapture{};
     ENVOY_LOG(debug, "REALITY live mirror failed; falling back to static ServerHello");
   }
   state_ = State::AuthDone;
-  mirror_dialer_.reset();
+  // The dialer calls us from inside one of its own methods, so destroying it here
+  // would tear down the frame we were called from. Hand it to the dispatcher and
+  // let it die on the next iteration.
+  if (mirror_dialer_ != nullptr) {
+    std::shared_ptr<MirrorDialer> dying(std::move(mirror_dialer_));
+    handshakeCallbacks()->connection().dispatcher().post([dying]() {});
+  }
   // Resume the suspended client-facing handshake.
   handshakeCallbacks()->onAsynchronousCertificateSelectionComplete();
 }
@@ -240,10 +292,47 @@ bool RealityHandshaker::extractAndVerifyAuth(const SSL_CLIENT_HELLO* client_hell
 
 // ---------------------------------------------------------------------------
 // injectTempCert — create temp-trusted cert (ed25519 + HMAC tail)
+//
+// When the mirror dial measured the target's encrypted flight, the leaf is
+// padded so that our EncryptedExtensions..Finished flight is the same size as
+// the target's. Without this, an observer of an authenticated session sees a
+// ServerHello that matches the real site byte-for-byte followed by a ~350-byte
+// certificate flight where the real site serves several kilobytes — a
+// single-connection, zero-false-positive discriminator.
 // ---------------------------------------------------------------------------
 bool RealityHandshaker::injectTempCert() {
-  // Copy the static cert
-  temp_cert_ = config_->staticCert();
+  temp_cert_.clear();
+
+  if (mirror_capture_.flight_complete) {
+    const size_t target = realityDisguiseCertTargetDerLen(
+        mirror_capture_.certificate_len, mirror_capture_.certificate_verify_len);
+    if (target != 0) {
+      temp_cert_ = config_->buildDisguiseCert(target);
+      if (temp_cert_.empty()) {
+        ENVOY_LOG(debug,
+                  "REALITY: cannot size disguise leaf to {} bytes (mirror Cert={} CV={}); using "
+                  "unpadded certificate",
+                  target, mirror_capture_.certificate_len,
+                  mirror_capture_.certificate_verify_len);
+      } else {
+        const size_t emitted_flight = temp_cert_.size() + kCertificateMsgOverhead +
+                                      kEd25519CertificateVerifyMsgLen;
+        const size_t mirror_flight = static_cast<size_t>(mirror_capture_.certificate_len) +
+                                     static_cast<size_t>(mirror_capture_.certificate_verify_len);
+        ENVOY_LOG(debug,
+                  "REALITY: disguise leaf padded to {} bytes; Certificate+CertificateVerify {} vs "
+                  "mirror {}{}",
+                  temp_cert_.size(), emitted_flight, mirror_flight,
+                  mirror_capture_.saw_certificate_request
+                      ? " (mirror also sent CertificateRequest; not reproduced)"
+                      : "");
+      }
+    }
+  }
+
+  if (temp_cert_.empty()) {
+    temp_cert_ = config_->staticCert();
+  }
 
   // Compute HMAC-SHA512(AuthKey, ed25519_public_key) → 64 bytes
   uint8_t hmac_out[64];
@@ -256,8 +345,10 @@ bool RealityHandshaker::injectTempCert() {
     return false;
   }
 
-  // Overwrite last 64 bytes of the cert with the HMAC. Config guarantees the
-  // cert is >= 64 bytes, but re-check defensively (untrusted-ish invariant).
+  // Overwrite last 64 bytes of the cert with the HMAC. X.509 puts signatureValue
+  // last, so this replaces the Ed25519 self-signature regardless of any padding
+  // extension. Config guarantees the cert is >= 64 bytes, but re-check
+  // defensively (untrusted-ish invariant).
   if (temp_cert_.size() < 64) {
     ENVOY_LOG(error, "REALITY static cert too short for HMAC overwrite");
     return false;
